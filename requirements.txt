@@ -1,0 +1,5 @@
+aiogram
+playwright
+beautifulsoup4
+openai
+aiohttp
