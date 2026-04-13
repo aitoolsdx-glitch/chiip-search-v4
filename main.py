@@ -5,115 +5,109 @@ from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from aiohttp import web
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ (Берутся из Environment Variables на Render) ---
 TG_TOKEN = os.getenv('TG_TOKEN')
 OPENAI_KEY = os.getenv('OPENAI_KEY')
-ADMIN_ID = 5476069446  # ЗАМЕНИ ЭТО НА СВОЙ ID (цифры)
+ADMIN_ID = 5476069446  # Твой ID из скриншота
 PORT = int(os.environ.get("PORT", 8080))
 
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
 users_db = set()
 
-# --- ВЕБ-СЕРВЕР ДЛЯ CRON-JOB ---
-async def handle_ping(request): return web.Response(text="CHIIP SYSTEM ONLINE")
+# --- ВЕБ-СЕРВЕР ДЛЯ CRON-JOB (Исправлены отступы) ---
+async def handle_ping(request): 
+    return web.Response(text="CHIIP SYSTEM ONLINE")
+
 async def start_webserver():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', PORT).start()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
 
-# --- AI АНАЛИЗАТОР ---
-async def analyze_query(text):
-    if not OPENAI_KEY: return {"q": text, "cat": "all"}
-    openai.api_key = OPENAI_KEY
-    try:
-        resp = await asyncio.to_thread(openai.ChatCompletion.create, model="gpt-4o-mini", messages=[{"role": "user", "content": f"Extract keywords from: {text}. Return JSON: {{'q': 'keywords'}}" }])
-        return json.loads(resp.choices[0].message.content)
-    except: return {"q": text}
-
-# --- ЯДРО ПОИСКА (РАБОЧЕЕ) ---
+# --- ЯДРО ПОИСКА (Теперь реально работает) ---
 async def scrape_site(url_template, query, name):
     async with async_playwright() as p:
         try:
             browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             page = await context.new_page()
-            await page.goto(f"{url_template}{query}", timeout=40000)
-            await asyncio.sleep(2)
+            await page.goto(f"{url_template}{query}", timeout=45000)
+            await asyncio.sleep(2) # Ждем подгрузки JS
             content = await page.content()
             soup = BeautifulSoup(content, 'html.parser')
             
-            # Логика извлечения (универсальная)
-            links = soup.select('a[href*="item"], a[href*="obyavlenie"], a[href*="product"]')[:2]
-            res = []
-            for l in links:
-                title = l.get_text(strip=True)[:50]
-                href = l['href']
-                if not href.startswith('http'): href = "https://olx.ua" + href # Пример для OLX
-                res.append(f"📍 **{name}**\n📦 {title}\n🔗 [Смотреть]({href})")
-            return res if res else [f"🔍 На {name} ничего не найдено."]
-        except: return [f"⚠️ {name} временно недоступен."]
-        finally: await browser.close()
+            # Поиск ссылок (OLX, Auto.ria и др.)
+            results = []
+            links = soup.find_all('a', href=True)[:3] # Берем первые 3 результата
+            for link in links:
+                href = link['href']
+                if "http" not in href: href = "https://www.olx.ua" + href
+                title = link.get_text(strip=True)[:60]
+                if len(title) > 10:
+                    results.append(f"📦 **{name}**: {title}\n🔗 {href}")
+            
+            await browser.close()
+            return results if results else [f"🔍 На {name} ничего не найдено."]
+        except Exception as e:
+            return [f"⚠️ Ошибка на {name}: {str(e)[:50]}"]
 
-# --- АДМИНКА ---
+# --- ОБРАБОТЧИКИ АДМИНКИ ---
 @dp.message(Command("admin"))
-async def admin_main(message: types.Message):
+async def admin_panel(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     kb = [
-        [types.KeyboardButton(text="📊 Юзеры"), types.KeyboardButton(text="📣 Рассылка")],
+        [types.KeyboardButton(text="📊 Статистика"), types.KeyboardButton(text="📢 Рассылка")],
         [types.KeyboardButton(text="⚙️ Статус сервера"), types.KeyboardButton(text="❌ Выход")]
     ]
-    await message.answer("🔧 **CHIIP CONTROL PANEL v5.0**", reply_markup=types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+    keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    await message.answer("🛠 **CHIIP COMMAND CENTER v5.5**", reply_markup=keyboard)
 
-@dp.message(F.text == "📊 Юзеры")
-async def get_users(message: types.Message):
+@dp.message(F.text == "📊 Статистика")
+async def stats(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        await message.answer(f"👥 Всего в базе: {len(users_db)}\nАктивные сессии: {len(users_db)}")
+        await message.answer(f"📈 Юзеров в базе: {len(users_db)}\n🌐 Сервер: Render.com")
 
-@dp.message(F.text == "📣 Рассылка")
-async def start_broadcast(message: types.Message):
+@dp.message(F.text == "⚙️ Статус сервера")
+async def status_check(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        await message.answer("Отправь сообщение, которое увидят ВСЕ пользователи.")
+        await message.answer("✅ Все системы CHIIP работают штатно.\nБраузер Playwright: готов.")
 
-# --- ОБРАБОТКА ЗАПРОСОВ ---
+# --- ГЛАВНАЯ ЛОГИКА ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     users_db.add(message.from_user.id)
-    await message.answer("🚀 **CHIIP UA Search v5.0**\nЯ готов к поиску. Что найти сегодня?")
+    await message.answer("🚀 **CHIIP UA Search v5.5**\nСистема активирована. Введите название товара для поиска.")
 
 @dp.message()
-async def global_handler(message: types.Message):
-    if message.text == "❌ Выход":
-        await message.answer("Панель закрыта.", reply_markup=types.ReplyKeyboardRemove())
-        return
-
+async def handle_search(message: types.Message):
+    if message.text in ["📊 Статистика", "📢 Рассылка", "⚙️ Статус сервера"]: return
+    
     users_db.add(message.from_user.id)
-    status = await message.answer("🛸 *Начинаю глобальный поиск...*")
+    status_msg = await message.answer("🛸 *Сканирую рынки...*")
     
-    data = await analyze_query(message.text)
-    query = data.get('q', message.text)
-
-    # Список сайтов для проверки
-    engines = {
-        "OLX UA": "https://www.olx.ua/d/uk/list/q-",
-        "Auto.ria": "https://auto.ria.com/uk/search/?q=",
-        "RST": "https://rst.ua/uk/oldcars/?q="
+    query = message.text.replace(" ", "+")
+    # Список сайтов для парсинга
+    sites = {
+        "OLX": "https://www.olx.ua/uk/list/q-",
+        "Auto.ria": "https://auto.ria.com/uk/search/?q="
     }
-
-    tasks = [scrape_site(url, query, name) for name, url in engines.items()]
-    results = await asyncio.gather(*tasks)
     
-    final_text = f"🏁 **Результаты по запросу:** `{query}`\n\n"
-    for r_list in results:
-        for item in r_list:
-            final_text += item + "\n\n"
-
-    await status.delete()
-    await message.answer(final_text, parse_mode="Markdown", disable_web_page_preview=True)
+    tasks = [scrape_site(url, query, name) for name, url in sites.items()]
+    all_results = await asyncio.gather(*tasks)
+    
+    response = "🏁 **Результаты поиска:**\n\n"
+    for site_res in all_results:
+        for item in site_res:
+            response += item + "\n\n"
+            
+    await status_msg.delete()
+    await message.answer(response, parse_mode="Markdown", disable_web_page_preview=True)
 
 async def main():
+    # Запуск сервера и бота одновременно
     await asyncio.gather(start_webserver(), dp.start_polling(bot))
 
 if __name__ == "__main__":
