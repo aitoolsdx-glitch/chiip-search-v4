@@ -145,14 +145,13 @@ async def global_handler(message: types.Message):
     if user_data and user_data.get("banned"):
         return await message.answer("🚫 Вы заблокированы в системе.")
 
-    # 2. ИГНОРИРУЕМ КНОПКИ И КОМАНДЫ (Чтобы не искать их в Google)
+    # 2. ИГНОРИРУЕМ КНОПКИ И КОМАНДЫ
     reserved_buttons = [
         "👤 Мой Профиль", "📜 История", "🆘 Поддержка", "⚙️ Настройки", "🔍 Найти товар",
         "🛡 СЕРВЕР", "🔋 ПОЛЬЗОВАТЕЛИ", "📣 РАССЫЛКА", "☢️ ТЕРМИНАЛ", "🔙 В МЕНЮ ЮЗЕРА",
         "📁 Дамп Базы", "🚫 Бан/Разбан по ID", "🔙 Назад в Админку", "📊 Полная Статистика", "📜 Логи", "🔙 Назад"
     ]
     if message.text in reserved_buttons or message.text.startswith("/"):
-        # Если это текст кнопки, но он попал сюда — значит мы просто ничего не делаем или логируем
         return
 
     # 3. ЛОГИКА ПОИСКА
@@ -161,7 +160,6 @@ async def global_handler(message: types.Message):
     
     status = await message.answer(f"🛰 *QUANTUM сканирует сети по запросу: {message.text}...*", parse_mode="Markdown")
     
-    # Определение сайтов
     query = message.text.lower()
     sites = {"Prom": f"https://prom.ua/search?search_term={query}", "OLX": f"https://www.olx.ua/d/uk/list/q-{query}"}
     
@@ -177,7 +175,6 @@ async def global_handler(message: types.Message):
             for name, url in sites.items():
                 page = await context.new_page()
                 await page.goto(url, wait_until="domcontentloaded", timeout=40000)
-                # Базовый парсинг ссылок
                 links = await page.evaluate("""
                     () => Array.from(document.querySelectorAll('a'))
                         .filter(a => a.innerText.length > 20 && a.href.includes('http'))
