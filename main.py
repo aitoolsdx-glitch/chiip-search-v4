@@ -7,13 +7,16 @@ import random
 import time
 import sys
 import platform
+import shutil
 from datetime import datetime, timedelta
 
+# Библиотеки для работы бота
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, 
-    FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+    FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand, BotCommandScopeDefault
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -21,342 +24,389 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from playwright.async_api import async_playwright
 from aiohttp import web
 
-# --- [ СИСТЕМНЫЕ НАСТРОЙКИ ] ---
+# --- [ ГЛОБАЛЬНЫЕ КОНСТАНТЫ ] ---
 TG_TOKEN = os.getenv('TG_TOKEN')
-ADMIN_ID = 5476069446 # Твой ID
+ADMIN_ID = 5476069446 # Твой ID (Daxo)
 PORT = int(os.environ.get("PORT", 8080))
+VERSION = "18.0 OMNI-MAX"
 
-# Глубокое логирование
+# Настройка логирования в файл и консоль
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("omni_system.log"), logging.StreamHandler()]
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler("omni_max.log", encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
-logger = logging.getLogger("OMNI-CORE")
+logger = logging.getLogger("OMNI-MAX-CORE")
 
-# Файлы данных
-DB_PATH = "omni_users.json"
-CONFIG_PATH = "omni_config.json"
-GLOBAL_STATS_PATH = "omni_stats.json"
+# Пути к файлам данных
+DB_USERS = "database_users.json"
+DB_STATS = "database_stats.json"
+SYSTEM_CONFIG = "system_config.json"
 
-# --- [ FSM: СОСТОЯНИЯ ] ---
-class OmniStates(StatesGroup):
-    wait_for_broadcast = State()
-    wait_for_shell = State()
-    wait_for_ban = State()
-    wait_for_unban = State()
-    wait_for_search = State()
-    wait_for_vip_add = State()
-    wait_for_timeout_change = State()
+# --- [ МАШИНА СОСТОЯНИЙ (FSM) ] ---
+class SystemStates(StatesGroup):
+    # Состояния для Админа
+    admin_terminal = State()
+    admin_broadcast = State()
+    admin_ban_user = State()
+    admin_set_timeout = State()
+    admin_add_vip = State()
+    # Состояния для Юзера
+    user_searching = State()
+    user_feedback = State()
 
-# --- [ ИНИЦИАЛИЗАЦИЯ БД И КОНФИГА ] ---
+# --- [ ЯДРО БАЗЫ ДАННЫХ И КОНФИГУРАЦИИ ] ---
 
-def init_system():
-    if not os.path.exists(DB_PATH):
-        json.dump({}, open(DB_PATH, "w"))
-    if not os.path.exists(CONFIG_PATH):
-        default_conf = {
-            "turbo": False, "maint": False, "timeout": 45000,
-            "proxies": [], "max_history": 10, "ver": "17.0 OMNI"
+def load_json(path, default):
+    if not os.path.exists(path):
+        with open(path, "w", encoding='utf-8') as f:
+            json.dump(default, f, ensure_all_ascii=False, indent=4)
+        return default
+    with open(path, "r", encoding='utf-8') as f:
+        return json.load(f)
+
+def save_json(path, data):
+    with open(path, "w", encoding='utf-8') as f:
+        json.dump(data, f, ensure_all_ascii=False, indent=4)
+
+# Инициализация системных данных
+db_users = load_json(DB_USERS, {})
+db_stats = load_json(DB_STATS, {"total_searches": 0, "errors": 0, "api_calls": 0})
+sys_config = load_json(SYSTEM_CONFIG, {
+    "maint_mode": False,
+    "turbo_mode": True,
+    "search_timeout": 50000,
+    "max_history": 15,
+    "allowed_sites": ["Rozetka", "OLX", "Prom", "AutoRia"]
+})
+
+def register_user(user: types.User):
+    uid = str(user.id)
+    if uid not in db_users:
+        db_users[uid] = {
+            "username": user.username,
+            "full_name": user.full_name,
+            "join_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "search_count": 0,
+            "history": [],
+            "is_vip": False,
+            "is_banned": False,
+            "last_active": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-        json.dump(default_conf, open(CONFIG_PATH, "w"))
-    if not os.path.exists(GLOBAL_STATS_PATH):
-        json.dump({"total_searches": 0, "errors": 0, "starts": 0}, open(GLOBAL_STATS_PATH, "w"))
+        save_json(DB_USERS, db_users)
+        logger.info(f"Зарегистрирован новый пользователь: {uid}")
 
-def get_db(): return json.load(open(DB_PATH))
-def save_db(data): json.dump(data, open(DB_PATH, "w", encoding="utf-8"), indent=4, ensure_all_ascii=False)
-def get_conf(): return json.load(open(CONFIG_PATH))
-def save_conf(c): json.dump(c, open(CONFIG_PATH, "w"), indent=4)
-def get_gstats(): return json.load(open(GLOBAL_STATS_PATH))
-def save_gstats(s): json.dump(s, open(GLOBAL_STATS_PATH, "w"))
+# --- [ ГЕНЕРАТОРЫ ИНТЕРФЕЙСА ] ---
 
-# --- [ КЛАВИАТУРЫ: ГИПЕР-ИНТЕРФЕЙС ] ---
+def get_main_kb(user_id):
+    buttons = [
+        [KeyboardButton(text="🔍 Начать поиск"), KeyboardButton(text="👤 Мой Профиль")],
+        [KeyboardButton(text="📜 История запросов"), KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="🆘 Поддержка"), KeyboardButton(text="💎 VIP Статус")]
+    ]
+    # Если зашел админ, добавляем кнопку входа в систему
+    if user_id == ADMIN_ID:
+        buttons.insert(0, [KeyboardButton(text="🔱 ПАНЕЛЬ УПРАВЛЕНИЯ 🔱")])
+        
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-def kb_user_main():
+def get_admin_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🔍 ПОИСК ТОВАРА"), KeyboardButton(text="💎 VIP ДОСТУП")],
-        [KeyboardButton(text="👤 МОЙ АККАУНТ"), KeyboardButton(text="📜 ИСТОРИЯ")],
-        [KeyboardButton(text="⚙️ НАСТРОЙКИ"), KeyboardButton(text="🆘 ПОМОЩЬ")]
+        [KeyboardButton(text="📊 Статистика Системы"), KeyboardButton(text="👥 Управление Юзерами")],
+        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="🐚 Терминал (SSH)")],
+        [KeyboardButton(text="⚙️ Конфиг Ядра"), KeyboardButton(text="📂 Дамп БД")],
+        [KeyboardButton(text="🛑 Режим Техработ"), KeyboardButton(text="🔙 Выход из Админки")]
     ], resize_keyboard=True)
 
-def kb_admin_main():
+def get_user_manage_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🛰 МОНИТОРИНГ"), KeyboardButton(text="👥 ЮЗЕР-МЕНЕДЖЕР")],
-        [KeyboardButton(text="📢 РАССЫЛКА"), KeyboardButton(text="💻 КОНСОЛЬ")],
-        [KeyboardButton(text="🛠 КОНФИГУРАЦИЯ"), KeyboardButton(text="📂 БЭКАП БД")],
-        [KeyboardButton(text="🔄 REBOOT СЕРВЕРА"), KeyboardButton(text="🚪 ВЫЙТИ")]
+        [KeyboardButton(text="🚫 Забанить ID"), KeyboardButton(text="✅ Разбанить ID")],
+        [KeyboardButton(text="👑 Выдать VIP"), KeyboardButton(text="📜 Логи запросов")],
+        [KeyboardButton(text="🔙 Назад в Админку")]
     ], resize_keyboard=True)
 
-def kb_admin_users():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🚫 ЗАБАНИТЬ"), KeyboardButton(text="✅ РАЗБАНИТЬ")],
-        [KeyboardButton(text="👑 ВЫДАТЬ VIP"), KeyboardButton(text="📊 ТОП ЮЗЕРОВ")],
-        [KeyboardButton(text="🔙 НАЗАД")]
-    ], resize_keyboard=True)
-
-def kb_admin_config():
-    c = get_conf()
-    t = "🚀 ТУРБО: ВКЛ" if c["turbo"] else "🚀 ТУРБО: ВЫКЛ"
-    m = "🚧 ТЕХРАБ: ВКЛ" if c["maint"] else "🚧 ТЕХРАБ: ВЫКЛ"
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text=t), KeyboardButton(text=m)],
-        [KeyboardButton(text="⏱ ТАЙМАУТ"), KeyboardButton(text="🧹 ЧИСТКА ЛОГОВ")],
-        [KeyboardButton(text="🔙 НАЗАД")]
-    ], resize_keyboard=True)
-
-# --- [ MIDDLEWARE & UTILS ] ---
-
-def is_admin(u_id): return u_id == ADMIN_ID
-
-def format_time(seconds):
-    return str(timedelta(seconds=int(seconds)))
-
-async def update_stat(key):
-    s = get_gstats()
-    s[key] += 1
-    save_gstats(s)
-
-# --- [ ОБРАБОТЧИКИ КОМАНД ] ---
-
+# --- [ ИНИЦИАЛИЗАЦИЯ БОТА ] ---
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# --- [ ОБРАБОТЧИКИ КОМАНД ] ---
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    db = get_db()
-    uid = str(message.from_user.id)
-    if uid not in db:
-        db[uid] = {
-            "u": message.from_user.username,
-            "d": datetime.now().strftime("%Y-%m-%d"),
-            "s": 0, "h": [], "b": False, "vip": False
-        }
-        save_db(db)
-        await update_stat("starts")
-    
-    await message.answer(
-        f"🤖 **OMNI-SYSTEM v17.0 ONLINE**\n\nПривет, {message.from_user.first_name}!\nЯ готов к поиску любой сложности.",
-        reply_markup=kb_user_main(), parse_mode="Markdown"
+    register_user(message.from_user)
+    welcome_msg = (
+        f"👋 **Приветствуем в {VERSION}!**\n\n"
+        "Я — высокопроизводительный поисковой агрегатор на базе ИИ.\n"
+        "Используйте меню ниже для навигации."
     )
+    await message.answer(welcome_msg, reply_markup=get_main_kb(message.from_user.id), parse_mode="Markdown")
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message):
-    if not is_admin(message.from_user.id): return
-    await message.answer("🧪 **ДОСТУП К OMNI-CORE РАЗРЕШЕН**", reply_markup=kb_admin_main())
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("⚠️ Доступ запрещен. Ваш ID не в списке Root-администраторов.")
+    await message.answer("🛡 **OMNI-MAX CORE: АВТОРИЗАЦИЯ УСПЕШНА**", reply_markup=get_admin_kb())
 
-# --- [ ЮЗЕР-СЕРВИСЫ ] ---
+# --- [ ФУНКЦИОНАЛ ПОЛЬЗОВАТЕЛЯ ] ---
 
-@dp.message(F.text == "👤 МОЙ АККАУНТ")
-async def user_acc(message: types.Message):
-    db = get_db()
-    u = db.get(str(message.from_user.id))
-    status = "👑 VIP Пользователь" if u.get("vip") else "👤 Обычный"
-    text = (f"👤 **ПРОФИЛЬ: {message.from_user.full_name}**\n\n"
-            f"🆔 ID: `{message.from_user.id}`\n"
-            f"📊 Статус: {status}\n"
-            f"📅 В системе: {u['d']}\n"
-            f"🔎 Поисков: {u['s']}")
+@dp.message(F.text == "👤 Мой Профиль")
+async def user_profile(message: types.Message):
+    u = db_users.get(str(message.from_user.id))
+    if not u: return
+    
+    vip_status = "✅ Активирован" if u['is_vip'] else "❌ Отсутствует"
+    text = (
+        f"👤 **ВАШ ТИТАН-ПРОФИЛЬ**\n\n"
+        f"🆔 ID: `{message.from_user.id}`\n"
+        f"📅 Регистрация: `{u['join_date']}`\n"
+        f"🔎 Поисков выполнено: `{u['search_count']}`\n"
+        f"💎 VIP: {vip_status}\n"
+        f"🌐 Язык: `Украинский/Русский`"
+    )
     await message.answer(text, parse_mode="Markdown")
 
-@dp.message(F.text == "📜 ИСТОРИЯ")
-async def user_hist(message: types.Message):
-    db = get_db()
-    h = db.get(str(message.from_user.id), {}).get("h", [])
-    if not h: return await message.answer("История пуста.")
-    text = "📜 **ПОСЛЕДНИЕ ЗАПРОСЫ:**\n\n" + "\n".join([f"• {x}" for x in h])
-    await message.answer(text)
-
-@dp.message(F.text == "💎 VIP ДОСТУП")
-async def user_vip(message: types.Message):
-    await message.answer("💎 **Преимущества VIP:**\n\n1. Приоритетный поиск.\n2. Доступ к закрытым базам.\n3. Без ограничений по количеству.\n\n*Для получения напишите администратору.*")
-
-# --- [ АДМИН-ЛОГИКА: МОНИТОРИНГ ] ---
-
-@dp.message(F.text == "🛰 МОНИТОРИНГ")
-async def adm_mon(message: types.Message):
-    if not is_admin(message.from_user.id): return
+@dp.message(F.text == "📜 История запросов")
+async def user_history(message: types.Message):
+    u = db_users.get(str(message.from_user.id))
+    hist = u.get("history", [])
+    if not hist:
+        return await message.answer("Ваша история поиска пока пуста.")
     
-    mem = subprocess.getoutput("free -m | grep Mem | awk '{print $3 \"/\" $2 \"MB\"}'")
-    load = platform.loadavg() if platform.system() != 'Windows' else "N/A"
-    st = get_gstats()
+    formatted = "\n".join([f"• {item}" for item in hist[-10:]])
+    await message.answer(f"📜 **ВАШИ ПОСЛЕДНИЕ ЗАПРОСЫ:**\n\n{formatted}", parse_mode="Markdown")
+
+@dp.message(F.text == "💎 VIP Статус")
+async def user_vip_info(message: types.Message):
+    await message.answer(
+        "💎 **VIP ПРИВИЛЕГИИ:**\n\n"
+        "1. Парсинг закрытых площадок.\n"
+        "2. Увеличенная скорость (Turbo Scrape).\n"
+        "3. Отсутствие задержек между запросами.\n"
+        "4. Ранний доступ к v19.0.\n\n"
+        "Для покупки обратитесь к @Daxo_Official"
+    )
+
+# --- [ АДМИН-ПАНЕЛЬ: УПРАВЛЕНИЕ СИСТЕМОЙ ] ---
+
+@dp.message(F.text == "📊 Статистика Системы")
+async def admin_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
     
-    text = (f"🛰 **SYSTEM OMNI REPORT**\n\n"
-            f"🧠 RAM: `{mem}`\n"
-            f"📈 Load: `{load}`\n"
-            f"👥 Юзеров: {len(get_db())}\n"
-            f"🔎 Всего поисков: {st['total_searches']}\n"
-            f"❌ Ошибок ИИ: {st['errors']}")
+    # Сбор данных о системе
+    mem_total, mem_used, mem_free = shutil.disk_usage("/")
+    uptime = subprocess.getoutput("uptime -p")
+    db_size = os.path.getsize(DB_USERS) / 1024
+    
+    text = (
+        "📊 **OMNI-MAX GLOBAL REPORT**\n\n"
+        f"👥 Всего юзеров: `{len(db_users)}`\n"
+        f"🔎 Всего поисков: `{db_stats['total_searches']}`\n"
+        f"❌ Ошибок системы: `{db_stats['errors']}`\n"
+        f"💾 База данных: `{db_size:.2f} KB`\n"
+        f"⏳ Uptime: `{uptime}`\n"
+        f"🧠 Диск: `{mem_used // (2**30)} ГБ / {mem_total // (2**30)} ГБ`"
+    )
     await message.answer(text, parse_mode="Markdown")
 
-# --- [ АДМИН-ЛОГИКА: КОНСОЛЬ (FSM) ] ---
+@dp.message(F.text == "🐚 Терминал (SSH)")
+async def admin_terminal_start(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    await state.set_state(SystemStates.admin_terminal)
+    await message.answer("🐚 **READY FOR COMMANDS**\nВведите команду для исполнения или 'exit' для выхода.")
 
-@dp.message(F.text == "💻 КОНСОЛЬ")
-async def adm_shell(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    await state.set_state(OmniStates.wait_for_shell)
-    await message.answer("💻 **OMNI SHELL READY**\nВведите команду или 'exit':")
-
-@dp.message(OmniStates.wait_for_shell)
-async def shell_proc(message: types.Message, state: FSMContext):
+@dp.message(SystemStates.admin_terminal)
+async def admin_terminal_proc(message: types.Message, state: FSMContext):
     if message.text.lower() == "exit":
         await state.clear()
-        return await message.answer("Консоль закрыта.", reply_markup=kb_admin_main())
+        return await message.answer("Терминал закрыт.", reply_markup=get_admin_kb())
     
     try:
-        res = subprocess.check_output(message.text, shell=True, stderr=subprocess.STDOUT, timeout=15).decode("utf-8")
-        await message.answer(f"✅ `Result:`\n`{res[:4000]}`", parse_mode="Markdown")
+        # Выполнение команды
+        result = subprocess.check_output(message.text, shell=True, stderr=subprocess.STDOUT, timeout=15).decode("utf-8")
+        if not result: result = "Done (No output)."
+        await message.answer(f"✅ **OUTPUT:**\n`{result[:4000]}`", parse_mode="Markdown")
     except Exception as e:
-        await message.answer(f"❌ `Error:`\n`{str(e)}`", parse_mode="Markdown")
+        await message.answer(f"❌ **ERROR:**\n`{str(e)}`", parse_mode="Markdown")
 
-# --- [ АДМИН-ЛОГИКА: РАССЫЛКА ] ---
+@dp.message(F.text == "📢 Рассылка")
+async def admin_broadcast_start(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    await state.set_state(SystemStates.admin_broadcast)
+    await message.answer("Отправьте сообщение (текст/фото/видео), которое получат все.")
 
-@dp.message(F.text == "📢 РАССЫЛКА")
-async def adm_br(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    await state.set_state(OmniStates.wait_for_broadcast)
-    await message.answer("Введите текст рассылки:")
-
-@dp.message(OmniStates.wait_for_broadcast)
-async def br_proc(message: types.Message, state: FSMContext):
-    db = get_db()
-    ids = list(db.keys())
-    done, err = 0, 0
-    for uid in ids:
+@dp.message(SystemStates.admin_broadcast)
+async def admin_broadcast_proc(message: types.Message, state: FSMContext):
+    uids = list(db_users.keys())
+    sent = 0
+    await message.answer(f"🚀 Запущена рассылка на {len(uids)} человек...")
+    
+    for uid in uids:
         try:
-            await bot.send_message(uid, f"📢 **СООБЩЕНИЕ ОТ АДМИНИСТРАЦИИ**\n\n{message.text}", parse_mode="Markdown")
-            done += 1
+            await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
+            sent += 1
             await asyncio.sleep(0.05)
-        except: err += 1
+        except: continue
+        
     await state.clear()
-    await message.answer(f"✅ Готово! Успешно: {done}, Ошибок: {err}")
+    await message.answer(f"✅ Рассылка завершена. Получили: {sent} юзеров.", reply_markup=get_admin_kb())
 
-# --- [ АДМИН-ЛОГИКА: КОНФИГ ] ---
+@dp.message(F.text == "📂 Дамп БД")
+async def admin_dump(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    await message.answer_document(FSInputFile(DB_USERS), caption="📦 Дамп базы пользователей")
+    await message.answer_document(FSInputFile(DB_STATS), caption="📈 Дамп статистики")
 
-@dp.message(F.text == "🛠 КОНФИГУРАЦИЯ")
-async def adm_conf(message: types.Message):
-    if not is_admin(message.from_user.id): return
-    await message.answer("Настройки ядра:", reply_markup=kb_admin_config())
+@dp.message(F.text == "🔙 Выход из Админки")
+async def exit_admin(message: types.Message):
+    await message.answer("Вы перешли в режим пользователя.", reply_markup=get_main_kb(message.from_user.id))
 
-@dp.message(F.text.contains("🚀 ТУРБО:"))
-async def toggle_turbo(message: types.Message):
-    if not is_admin(message.from_user.id): return
-    c = get_conf()
-    c["turbo"] = not c["turbo"]
-    c["timeout"] = 90000 if c["turbo"] else 45000
-    save_conf(c)
-    await adm_conf(message)
+# --- [ ЯДРО ПОИСКА: TITAN OMNI ENGINE ] ---
 
-# --- [ ЯДРО ПОИСКА: OMNI SCRAPE ENGINE ] ---
-
-async def titan_parser(context, name, url, query):
+async def perform_scraping(context, site_name, url_template, query):
     page = await context.new_page()
-    conf = get_conf()
     try:
-        # Интеллектуальный поиск
-        target = url.replace("{q}", query.replace(" ", "+"))
-        await page.goto(target, wait_until="domcontentloaded", timeout=conf["timeout"])
-        await asyncio.sleep(random.uniform(2, 4)) # Анти-фрод
-
-        # Динамический сбор данных через JS
+        url = url_template.replace("{q}", query.replace(" ", "+"))
+        await page.goto(url, wait_until="domcontentloaded", timeout=sys_config["search_timeout"])
+        
+        # Интеллектуальное ожидание и эмуляция прокрутки
+        await asyncio.sleep(random.uniform(2, 4))
+        await page.mouse.wheel(0, 500)
+        
+        # JS-скрипт для извлечения данных (находит ссылки, содержащие слова запроса)
         results = await page.evaluate(f"""
             () => {{
-                const q = "{query.lower()}".split(" ");
-                const items = Array.from(document.querySelectorAll('a'));
-                return items
-                    .filter(a => {{
-                        const t = a.innerText.toLowerCase();
-                        return q.every(w => t.includes(w)) && a.href.startsWith('http') && t.length > 10;
-                    }})
-                    .slice(0, 2)
-                    .map(a => ({{ title: a.innerText.trim().split('\\n')[0], link: a.href }}));
+                const qWords = "{query.lower()}".split(" ");
+                const links = Array.from(document.querySelectorAll('a'));
+                const found = [];
+                for (let a of links) {{
+                    const t = a.innerText.toLowerCase();
+                    if (qWords.every(w => t.includes(w)) && a.href.startsWith('http') && t.length > 10) {{
+                        found.push({{ title: a.innerText.trim().split('\\n')[0], link: a.href }});
+                    }}
+                    if (found.length >= 2) break;
+                }}
+                return found;
             }}
         """)
-        return [f"📦 **{name}**: {r['title'][:60]}...\n🔗 {r['link']}" for r in results]
+        return [f"📦 **{site_name}**: {r['title'][:55]}...\n🔗 {r['link']}" for r in results]
     except Exception as e:
-        logger.error(f"Scrape Error {name}: {str(e)}")
+        logger.error(f"Scrape Error at {site_name}: {str(e)}")
         return []
     finally:
         await page.close()
 
-# --- [ ГЛАВНЫЙ ОБРАБОТЧИК (SEARCH) ] ---
+# --- [ ОБРАБОТЧИК ВСЕХ ТЕКСТОВЫХ СООБЩЕНИЙ ] ---
 
 @dp.message(F.text)
-async def main_engine(message: types.Message):
-    # Фильтр кнопок
-    reserved = [
-        "🔍 ПОИСК ТОВАРА", "💎 VIP ДОСТУП", "👤 МОЙ АККАУНТ", "📜 ИСТОРИЯ", "⚙️ НАСТРОЙКИ", "🆘 ПОМОЩЬ",
-        "🛰 МОНИТОРИНГ", "👥 ЮЗЕР-МЕНЕДЖЕР", "📢 РАССЫЛКА", "💻 КОНСОЛЬ", "🛠 КОНФИГУРАЦИЯ", "📂 БЭКАП БД",
-        "🔄 REBOOT СЕРВЕРА", "🚪 ВЫЙТИ", "🔙 НАЗАД", "🚫 ЗАБАНИТЬ", "✅ РАЗБАНИТЬ", "👑 ВЫДАДЬ VIP", "📊 ТОП ЮЗЕРОВ",
-        "🚀 ТУРБО: ВКЛ", "🚀 ТУРБО: ВЫКЛ", "🚧 ТЕХРАБ: ВКЛ", "🚧 ТЕХРАБ: ВЫКЛ", "⏱ ТАЙМАУТ", "🧹 ЧИСТКА ЛОГОВ"
+async def main_handler(message: types.Message):
+    # 1. Исключаем кнопки из поиска
+    reserved_texts = [
+        "🔍 Начать поиск", "👤 Мой Профиль", "📜 История запросов", "⚙️ Настройки", "🆘 Поддержка", "💎 VIP Статус",
+        "📊 Статистика Системы", "👥 Управление Юзерами", "📢 Рассылка", "🐚 Терминал (SSH)", "⚙️ Конфиг Ядра",
+        "📂 Дамп БД", "🛑 Режим Техработ", "🔙 Выход из Админки", "🚫 Забанить ID", "✅ Разбанить ID",
+        "👑 Выдать VIP", "📜 Логи запросов", "🔙 Назад в Админку", "🔱 ПАНЕЛЬ УПРАВЛЕНИЯ 🔱"
     ]
-    if message.text in reserved or message.text.startswith("/"): return
+    if message.text in reserved_texts or message.text.startswith("/"):
+        # Если нажата кнопка админки (через текст)
+        if message.text == "🔱 ПАНЕЛЬ УПРАВЛЕНИЯ 🔱":
+            return await cmd_admin(message)
+        return
 
-    # Проверка техработ
-    conf = get_conf()
-    if conf["maint"] and not is_admin(message.from_user.id):
-        return await message.answer("🚧 Бот временно на обслуживании.")
+    # 2. Проверка техработ
+    if sys_config["maint_mode"] and message.from_user.id != ADMIN_ID:
+        return await message.answer("🚧 **СИСТЕМА НА ОБСЛУЖИВАНИИ**\n\nМы обновляем базу данных. Попробуйте через 30 минут.")
 
-    # Логика БД
-    db = get_db()
+    # 3. Обновление БД
     uid = str(message.from_user.id)
-    if uid in db:
-        db[uid]["s"] += 1
-        db[uid]["h"] = ([message.text] + db[uid]["h"])[:conf["max_history"]]
-        save_db(db)
+    if uid in db_users:
+        db_users[uid]["search_count"] += 1
+        db_users[uid]["history"] = ([message.text] + db_users[uid]["history"])[:sys_config["max_history"]]
+        db_users[uid]["last_active"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_json(DB_USERS, db_users)
     
-    await update_stat("total_searches")
-    status = await message.answer(f"🛰 **OMNI ИЩЕТ:** `{message.text}`...", parse_mode="Markdown")
+    db_stats["total_searches"] += 1
+    save_json(DB_STATS, db_stats)
 
-    # Маршрутизация сайтов
+    # 4. Процесс парсинга
+    status = await message.answer(f"🛰 **OMNI-ENGINE v18 АКТИВИРОВАН**\n📡 *Запрос:* `{message.text}`\n🔍 *Статус:* Сканирование сетей...", parse_mode="Markdown")
+
     q = message.text.lower()
-    sites = {
+    search_map = {
         "Rozetka": "https://rozetka.com.ua/search/?text={q}",
         "Prom": "https://prom.ua/search?search_term={q}",
         "OLX": "https://www.olx.ua/d/uk/list/q-{q}/"
     }
-    if any(x in q for x in ["авто", "машина", "bmw", "mercedes", "audi", "mazda"]):
-        sites["AutoRia"] = "https://auto.ria.com/uk/search/?q={q}"
+    
+    # Расширенный поиск для авто
+    if any(car in q for car in ["авто", "машина", "bmw", "audi", "mazda", "ford", "mercedes"]):
+        search_map["AutoRia"] = "https://auto.ria.com/uk/search/?q={q}"
 
-    # Парсинг
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
-        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        # Установка браузера если нет (на всякий случай)
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+        context = await browser.new_context(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
         
-        tasks = [titan_parser(context, name, url, message.text) for name, url in sites.items()]
-        final_list = await asyncio.gather(*tasks)
+        tasks = [perform_scraping(context, name, url, message.text) for name, url in search_map.items()]
+        combined_results = await asyncio.gather(*tasks)
         await browser.close()
 
-    res = [item for sub in final_list for item in sub]
+    # Сглаживание списка результатов
+    final_results = [item for sublist in combined_results for item in sublist]
     await status.delete()
 
-    if res:
-        await message.answer("✅ **РЕЗУЛЬТАТЫ OMNI-CORE:**\n\n" + "\n\n".join(res), disable_web_page_preview=True)
+    if final_results:
+        output = "✅ **РЕЗУЛЬТАТЫ ПОИСКА OMNI:**\n\n" + "\n\n".join(final_results)
+        await message.answer(output, disable_web_page_preview=True, parse_mode="Markdown")
     else:
-        await update_stat("errors")
-        await message.answer("❌ **Товаров не найдено.** Попробуйте упростить запрос.")
+        db_stats["errors"] += 1
+        save_json(DB_STATS, db_stats)
+        await message.answer("❌ **Товаров не найдено.**\nПопробуйте изменить запрос (например, уберите лишние слова).")
 
-# --- [ ЗАПУСК СЕРВЕРА ] ---
+# --- [ ЗАПУСК ВЕБ-СЕРВЕРА (RENDER HEALTH CHECK) ] ---
 
-async def web_handle(request): return web.Response(text="OMNI v17.0 ACTIVE")
+async def health_check(request):
+    return web.Response(text=f"OMNI MAX v18.0: RUNNING\nUPTIME: {datetime.now()}", status=200)
 
-async def run_omni():
-    init_system()
-    # Чиним "Conflict" - сбрасываем вебхуки и старые апдейты
-    await bot.delete_webhook(drop_pending_updates=True)
-    
-    subprocess.run(["playwright", "install", "chromium"])
-    
+async def start_web():
     app = web.Application()
-    app.router.add_get("/", web_handle)
+    app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
+
+# --- [ ГЛАВНЫЙ ЦИКЛ RUN ] ---
+
+async def main():
+    logger.info("--- ЗАПУСК СИСТЕМЫ TITAN OMNI-MAX ---")
     
-    logger.info("OMNI SYSTEM STARTED SUCCESSFULLY")
-    await dp.start_polling(bot)
+    # 1. Сброс конфликтов (САМОЕ ВАЖНОЕ ДЛЯ ТЕБЯ)
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    # 2. Установка браузера (автоматизация для Render)
+    subprocess.run(["playwright", "install", "chromium"])
+    
+    # 3. Запуск веб-сервера
+    await start_web()
+    
+    # 4. Установка команд меню
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="admin", description="Админ-панель (только Root)")
+    ], scope=BotCommandScopeDefault())
+    
+    # 5. Старт поллинга
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.critical(f"Критическая ошибка работы: {e}")
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run_omni())
-    except:
-        logger.error("SYSTEM CRITICAL SHUTDOWN")
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Система остановлена пользователем.")
