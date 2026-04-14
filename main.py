@@ -1,55 +1,53 @@
 import asyncio
 import os
 import json
-import subprocess
 import logging
-import random
 import sys
+import random
+import subprocess
 import platform
 import shutil
 from datetime import datetime, timedelta
 
-# Библиотеки
+import aiohttp
+from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, 
-    FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton,
-    BotCommand, BotCommandScopeDefault
+    FSInputFile, BotCommand, BotCommandScopeDefault
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from playwright.async_api import async_playwright
 from aiohttp import web
 
-# --- [ СИСТЕМНЫЕ КОНСТАНТЫ ] ---
+# --- [ КОНФИГУРАЦИЯ ] ---
 TG_TOKEN = os.getenv('TG_TOKEN')
-ADMIN_ID = 5476069446 # Твой ID (Daxo)
+ADMIN_ID = 5476069446
 PORT = int(os.environ.get("PORT", 8080))
-VERSION = "19.0 OMNI-RECOVERY"
+VERSION = "20.0 TITAN-STABLE"
 
 # Логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.FileHandler("omni_core.log", encoding='utf-8'), logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("OMNI-SYSTEM")
+logger = logging.getLogger("TITAN-CORE")
 
-# Файлы данных
-DB_USERS = "database_users.json"
-DB_STATS = "database_stats.json"
-SYSTEM_CONFIG = "system_config.json"
+# База данных (JSON)
+DB_USERS = "titan_users.json"
+DB_STATS = "titan_stats.json"
 
-# --- [ FSM СОСТОЯНИЯ ] ---
-class SystemStates(StatesGroup):
-    admin_terminal = State()
-    admin_broadcast = State()
-    user_searching = State()
+# --- [ FSM ] ---
+class AdminStates(StatesGroup):
+    terminal = State()
+    broadcast = State()
+    edit_config = State()
 
-# --- [ ЯДРО ДАННЫХ ] ---
-def load_data(path, default):
+# --- [ СИСТЕМА ДАННЫХ ] ---
+def load_db(path, default):
     if not os.path.exists(path):
         with open(path, "w", encoding='utf-8') as f:
             json.dump(default, f, ensure_all_ascii=False, indent=4)
@@ -58,178 +56,217 @@ def load_data(path, default):
         try: return json.load(f)
         except: return default
 
-def save_data(path, data):
+def save_db(path, data):
     with open(path, "w", encoding='utf-8') as f:
         json.dump(data, f, ensure_all_ascii=False, indent=4)
 
-db_users = load_data(DB_USERS, {})
-db_stats = load_data(DB_STATS, {"total_searches": 0, "errors": 0})
-sys_config = load_data(SYSTEM_CONFIG, {"maint_mode": False, "search_timeout": 60000})
+db_users = load_db(DB_USERS, {})
+db_stats = load_db(DB_STATS, {"total_searches": 0, "errors": 0, "launches": 0})
 
-def log_user(user: types.User):
+def init_user(user: types.User):
     uid = str(user.id)
     if uid not in db_users:
         db_users[uid] = {
-            "name": user.full_name, "username": user.username,
-            "joined": datetime.now().strftime("%Y-%m-%d"),
-            "searches": 0, "vip": False, "history": []
+            "n": user.full_name, "u": user.username,
+            "date": datetime.now().strftime("%d.%m.%Y"),
+            "count": 0, "vip": False, "history": []
         }
-        save_data(DB_USERS, db_users)
+        save_db(DB_USERS, db_users)
 
 # --- [ КЛАВИАТУРЫ ] ---
-def get_main_kb(uid):
+def main_kb(uid):
     btns = [
-        [KeyboardButton(text="🔍 ПОИСК"), KeyboardButton(text="👤 ПРОФИЛЬ")],
-        [KeyboardButton(text="📜 ИСТОРИЯ"), KeyboardButton(text="💎 VIP")],
-        [KeyboardButton(text="🆘 ПОМОЩЬ")]
+        [KeyboardButton(text="🔎 ПОИСК ТОВАРОВ"), KeyboardButton(text="👤 МОЙ АККАУНТ")],
+        [KeyboardButton(text="📜 ИСТОРИЯ ЗАПРОСОВ"), KeyboardButton(text="💎 VIP СТАТУС")],
+        [KeyboardButton(text="🆘 ПОМОЩЬ / ИНФО")]
     ]
     if uid == ADMIN_ID:
-        btns.insert(0, [KeyboardButton(text="🔱 АДМИН-ЦЕНТР 🔱")])
+        btns.insert(0, [KeyboardButton(text="🔱 ТЕРМИНАЛ УПРАВЛЕНИЯ 🔱")])
     return ReplyKeyboardMarkup(keyboard=btns, resize_keyboard=True)
 
-def get_admin_kb():
+def admin_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🛰 СТАТУС"), KeyboardButton(text="🐚 ТЕРМИНАЛ")],
-        [KeyboardButton(text="📢 РАССЫЛКА"), KeyboardButton(text="📂 БЭКАП")],
-        [KeyboardButton(text="🔙 ВЫХОД")]
+        [KeyboardButton(text="📊 ПОЛНАЯ СТАТИСТИКА"), KeyboardButton(text="🐚 КОНСОЛЬ")],
+        [KeyboardButton(text="📢 РАССЫЛКА"), KeyboardButton(text="📂 СКАЧАТЬ БД")],
+        [KeyboardButton(text="🔙 НА ГЛАВНУЮ")]
     ], resize_keyboard=True)
 
-# --- [ ИНИЦИАЛИЗАЦИЯ ] ---
+# --- [ ИНИЦИАЛИЗАЦИЯ БОТА ] ---
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- [ ОБРАБОТЧИКИ ] ---
-@dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    log_user(message.from_user)
-    await message.answer(f"🚀 **OMNI v19.0 СИСТЕМА ЗАПУЩЕНА**\n\nГотов к работе, {message.from_user.first_name}!", 
-                         reply_markup=get_main_kb(message.from_user.id), parse_mode="Markdown")
+# --- [ ЛОГИКА АДМИН-ЦЕНТРА ] ---
 
-@dp.message(F.text == "🔱 АДМИН-ЦЕНТР 🔱")
-async def admin_panel(message: types.Message):
+@dp.message(F.text == "🔱 ТЕРМИНАЛ УПРАВЛЕНИЯ 🔱")
+async def adm_panel(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
-    await message.answer("🛠 **ВХОД В ЯДРО ВЫПОЛНЕН**", reply_markup=get_admin_kb())
+    await message.answer("🛠 **TITAN CORE v20.0: СИСТЕМА УПРАВЛЕНИЯ**", reply_markup=admin_kb())
 
-@dp.message(F.text == "🛰 СТАТУС")
-async def adm_status(message: types.Message):
+@dp.message(F.text == "📊 ПОЛНАЯ СТАТИСТИКА")
+async def adm_stats(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
-    uptime = subprocess.getoutput("uptime -p")
-    text = (f"🛰 **СИСТЕМНЫЙ ОТЧЕТ**\n\n"
-            f"👤 Юзеров: `{len(db_users)}`\n"
-            f"🔍 Поисков: `{db_stats['total_searches']}`\n"
-            f"⏱ Uptime: `{uptime}`\n"
+    mem = psutil.virtual_memory().percent if 'psutil' in sys.modules else "N/A"
+    text = (f"📊 **ОТЧЕТ TITAN-OMNI**\n\n"
+            f"👥 Пользователей: `{len(db_users)}`\n"
+            f"🔎 Всего запросов: `{db_stats['total_searches']}`\n"
+            f"⚙️ Ошибок ядра: `{db_stats['errors']}`\n"
+            f"🚀 Запусков: `{db_stats['launches']}`\n"
             f"📦 Версия: `{VERSION}`")
     await message.answer(text, parse_mode="Markdown")
 
-@dp.message(F.text == "🐚 ТЕРМИНАЛ")
-async def adm_term(message: types.Message, state: FSMContext):
+@dp.message(F.text == "🐚 КОНСОЛЬ")
+async def adm_shell(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
-    await state.set_state(SystemStates.admin_terminal)
-    await message.answer("🐚 **SSH ЭМУЛЯЦИЯ**\nВведите команду (или 'exit'):")
+    await state.set_state(AdminStates.terminal)
+    await message.answer("🐚 **TITAN SHELL ACTIVE**\nВведите системную команду (или 'exit'):")
 
-@dp.message(SystemStates.admin_terminal)
-async def term_proc(message: types.Message, state: FSMContext):
+@dp.message(AdminStates.terminal)
+async def shell_proc(message: types.Message, state: FSMContext):
     if message.text.lower() == "exit":
         await state.clear()
-        return await message.answer("Выход...", reply_markup=get_admin_kb())
+        return await message.answer("Выход из консоли.", reply_markup=admin_kb())
     try:
         res = subprocess.check_output(message.text, shell=True, stderr=subprocess.STDOUT, timeout=10).decode("utf-8")
-        await message.answer(f"✅ `Result:`\n`{res[:4000]}`", parse_mode="Markdown")
+        await message.answer(f"✅ `Output:`\n`{res[:4000]}`", parse_mode="Markdown")
     except Exception as e:
         await message.answer(f"❌ `Error:`\n`{str(e)}`", parse_mode="Markdown")
 
-@dp.message(F.text == "👤 ПРОФИЛЬ")
-async def u_prof(message: types.Message):
+@dp.message(F.text == "📂 СКАЧАТЬ БД")
+async def adm_db(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    await message.answer_document(FSInputFile(DB_USERS), caption="База пользователей")
+    await message.answer_document(FSInputFile(DB_STATS), caption="Статистика")
+
+# --- [ ЛОГИКА ПОЛЬЗОВАТЕЛЯ ] ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    init_user(message.from_user)
+    await message.answer(
+        f"🤖 **TITAN OMNI v20.0 ONLINE**\n\nДобро пожаловать, {message.from_user.first_name}!\n"
+        "Я — мощный агрегатор поиска товаров по Украине.\n"
+        "Просто напиши название товара.",
+        reply_markup=main_kb(message.from_user.id)
+    )
+
+@dp.message(F.text == "👤 МОЙ АККАУНТ")
+async def u_acc(message: types.Message):
     u = db_users.get(str(message.from_user.id))
     if not u: return
-    status = "💎 VIP" if u['vip'] else "👤 Обычный"
-    await message.answer(f"👤 **ПРОФИЛЬ**\n\nСтатус: {status}\nПоисков: {u['searches']}\nID: `{message.from_user.id}`", parse_mode="Markdown")
+    status = "👑 VIP" if u['vip'] else "👤 Базовый"
+    text = (f"👤 **ВАШ ПРОФИЛЬ**\n\n"
+            f"🆔 ID: `{message.from_user.id}`\n"
+            f"📊 Статус: {status}\n"
+            f"🔎 Поисков: {u['count']}\n"
+            f"📅 Дата регистрации: {u['date']}")
+    await message.answer(text, parse_mode="Markdown")
 
-# --- [ ПАРСЕР TITAN OMNI ] ---
-async def scrape(context, name, url_pattern, query):
-    page = await context.new_page()
+# --- [ ЯДРО ПАРСИНГА (TITAN-STABLE) ] ---
+
+async def fetch_site(session, name, url, query):
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
-        target = url_pattern.replace("{q}", query.replace(" ", "+"))
-        await page.goto(target, wait_until="domcontentloaded", timeout=sys_config["search_timeout"])
-        await asyncio.sleep(3)
-        
-        items = await page.evaluate(f"""
-            () => {{
-                const q = "{query.lower()}".split(" ");
-                const links = Array.from(document.querySelectorAll('a'));
-                const res = [];
-                for (let a of links) {{
-                    const t = a.innerText.toLowerCase();
-                    if (q.every(w => t.includes(w)) && a.href.includes('http') && t.length > 12) {{
-                        res.push({{ title: a.innerText.split('\\n')[0], link: a.href }});
-                    }}
-                    if (res.length >= 2) break;
-                }}
-                return res;
-            }}
-        """)
-        return [f"📦 **{name}**: {i['title'][:50]}...\n🔗 {i['link']}" for i in items]
+        full_url = url.format(q=query.replace(" ", "+"))
+        async with session.get(full_url, headers=headers, timeout=15) as response:
+            if response.status != 200: return []
+            html = await response.text()
+            soup = BeautifulSoup(html, 'lxml')
+            
+            results = []
+            if "olx.ua" in url:
+                cards = soup.find_all('a', href=True)
+                for c in cards:
+                    t = c.text.lower()
+                    if all(w in t for w in query.lower().split()) and "/d/uk/obyavlenie/" in c['href']:
+                        link = "https://www.olx.ua" + c['href'] if not c['href'].startswith('http') else c['href']
+                        results.append(f"📦 **OLX**: {c.text.strip()[:60]}...\n🔗 {link}")
+                        if len(results) >= 2: break
+            
+            elif "prom.ua" in url:
+                links = soup.find_all('a', href=True)
+                for l in links:
+                    t = l.get('title', '').lower() or l.text.lower()
+                    if all(w in t for w in query.lower().split()) and "/p" in l['href']:
+                        link = "https://prom.ua" + l['href'] if not l['href'].startswith('http') else l['href']
+                        results.append(f"📦 **Prom**: {t.strip()[:60]}...\n🔗 {link}")
+                        if len(results) >= 2: break
+
+            elif "rozetka" in url:
+                links = soup.find_all('a', href=True)
+                for l in links:
+                    if "/p" in l['href'] and len(l.text) > 15:
+                        t = l.text.lower()
+                        if all(w in t for w in query.lower().split()):
+                            results.append(f"📦 **Rozetka**: {l.text.strip()[:60]}...\n🔗 {l['href']}")
+                            if len(results) >= 2: break
+            return results
     except Exception as e:
-        logger.error(f"Error {name}: {e}")
+        logger.error(f"Error parsing {name}: {e}")
         return []
-    finally:
-        await page.close()
 
 @dp.message(F.text)
-async def main_engine(message: types.Message):
-    if message.text.startswith("/") or message.text in ["🔍 ПОИСК", "👤 ПРОФИЛЬ", "📜 ИСТОРИЯ", "💎 VIP", "🆘 ПОМОЩЬ", "🔱 АДМИН-ЦЕНТР 🔱", "🛰 СТАТУС", "🐚 ТЕРМИНАЛ", "📢 РАССЫЛКА", "📂 БЭКАП", "🔙 ВЫХОД"]:
-        return
+async def search_handler(message: types.Message):
+    # Блокировка команд и кнопок
+    if message.text.startswith("/") or len(message.text) < 3 or message.text in [
+        "🔎 ПОИСК ТОВАРОВ", "👤 МОЙ АККАУНТ", "📜 ИСТОРИЯ ЗАПРОСОВ", "💎 VIP СТАТУС", 
+        "🆘 ПОМОЩЬ / ИНФО", "🔱 ТЕРМИНАЛ УПРАВЛЕНИЯ 🔱", "📊 ПОЛНАЯ СТАТИСТИКА", 
+        "🐚 КОНСОЛЬ", "📢 РАССЫЛКА", "📂 СКАЧАТЬ БД", "🔙 НА ГЛАВНУЮ"
+    ]: return
 
     uid = str(message.from_user.id)
     if uid in db_users:
-        db_users[uid]["searches"] += 1
+        db_users[uid]["count"] += 1
         db_users[uid]["history"] = ([message.text] + db_users[uid]["history"])[:10]
-        save_data(DB_USERS, db_users)
+        save_db(DB_USERS, db_users)
     
     db_stats["total_searches"] += 1
-    save_data(DB_STATS, db_stats)
+    save_db(DB_STATS, db_stats)
 
-    status = await message.answer(f"🛰 **OMNI-V19 СКАН**\n🔎 `{message.text}`...")
+    status = await message.answer(f"🛰 **TITAN ENGINE v20**\n📡 Сканирую сеть по запросу: `{message.text}`...", parse_mode="Markdown")
 
-    sites = {
-        "Rozetka": "https://rozetka.com.ua/search/?text={q}",
+    urls = {
         "OLX": "https://www.olx.ua/d/uk/list/q-{q}/",
-        "Prom": "https://prom.ua/search?search_term={q}"
+        "Prom": "https://prom.ua/search?search_term={q}",
+        "Rozetka": "https://rozetka.com.ua/search/?text={q}"
     }
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
-        context = await browser.new_context(user_agent="Mozilla/5.0")
-        tasks = [scrape(context, n, u, message.text) for n, u in sites.items()]
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_site(session, name, url, message.text) for name, url in urls.items()]
         results = await asyncio.gather(*tasks)
-        await browser.close()
 
     flat_res = [i for s in results for i in s]
     await status.delete()
-    
+
     if flat_res:
-        await message.answer("✅ **НАЙДЕНО:**\n\n" + "\n\n".join(flat_res), disable_web_page_preview=True)
+        await message.answer("✅ **РЕЗУЛЬТАТЫ TITAN-CORE:**\n\n" + "\n\n".join(flat_res), disable_web_page_preview=True)
     else:
-        await message.answer("❌ Ничего не найдено. Упростите запрос.")
+        await message.answer("❌ Ничего не найдено. Попробуй уточнить название товара.")
 
-# --- [ SERVER ] ---
-async def handle(r): return web.Response(text="OMNI ALIVE")
+# --- [ СИСТЕМНЫЙ ЗАПУСК ] ---
 
-async def start_omni():
-    # ФИКС КОНФЛИКТА
+async def health_check(request): return web.Response(text="TITAN ACTIVE", status=200)
+
+async def main():
+    # КРИТИЧЕСКИЙ ФИКС КОНФЛИКТА
     await bot.delete_webhook(drop_pending_updates=True)
     
-    # Установка браузеров (важно для Render)
-    subprocess.run(["playwright", "install", "chromium"])
-    
+    db_stats["launches"] += 1
+    save_db(DB_STATS, db_stats)
+
+    # Веб-сервер для Render
     app = web.Application()
-    app.router.add_get("/", handle)
+    app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
+
+    await bot.set_my_commands([BotCommand(command="start", description="Запустить TITAN OMNI")])
     
-    await bot.set_my_commands([BotCommand(command="start", description="Запуск")])
+    logger.info(f"СИСТЕМА TITAN v{VERSION} ЗАПУЩЕНА")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(start_omni())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logger.critical(f"CRASH: {e}")
