@@ -2,13 +2,13 @@ import asyncio, os, json, subprocess, logging, random
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from aiohttp import web
 import openai
 
-# --- [ КРИТИЧЕСКИЕ НАСТРОЙКИ ] ---
+# --- [ СЕРДЦЕ СИСТЕМЫ ] ---
 TG_TOKEN = os.getenv('TG_TOKEN')
 OPENAI_KEY = os.getenv('OPENAI_KEY')
 ADMIN_ID = 5476069446
@@ -18,9 +18,8 @@ bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
 ai_client = openai.AsyncOpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
-# --- [ БАЗА ДАННЫХ 50+ САЙТОВ ] ---
+# --- [ БАЗА ДАННЫХ САЙТОВ (Расширенная) ] ---
 SITES = {
-    # ТЕХНИКА И МАРКЕТПЛЕЙСЫ
     "Rozetka": ["https://rozetka.com.ua/search/?text=", "tech"],
     "Prom": ["https://prom.ua/search?search_term=", "all"],
     "Hotline": ["https://hotline.ua/sr/?q=", "tech"],
@@ -28,200 +27,222 @@ SITES = {
     "Allo": ["https://allo.ua/ru/catalogsearch/result/?q=", "tech"],
     "Foxtrot": ["https://www.foxtrot.com.ua/uk/search?query=", "tech"],
     "Comfy": ["https://comfy.ua/search/?q=", "tech"],
-    "Citrus": ["https://www.citrus.ua/search?query=", "tech"],
-    "Stylus": ["https://stylus.ua/uk/search?q=", "tech"],
-    "Moyo": ["https://www.moyo.ua/search/?q=", "tech"],
-    "Brain": ["https://brain.com.ua/uk/search/q=", "tech"],
-    "Yabko": ["https://yabko.ua/search/?q=", "tech"],
-    
-    # АВТО
     "Auto.ria": ["https://auto.ria.com/uk/search/?q=", "auto"],
     "OLX": ["https://www.olx.ua/d/uk/list/q-", "all"],
     "RST": ["https://rst.ua/uk/oldcars/?task=search&q=", "auto"],
-    
-    # МОДА И ОДЕЖДА
-    "Intertop": ["https://intertop.ua/ua/search/?q=", "fashion"],
-    "Modivo": ["https://modivo.ua/s?q=", "fashion"],
-    "Lamoda": ["https://www.lamoda.ua/catalogsearch/result/?q=", "fashion"],
-    "Shafa": ["https://shafa.ua/uk/search?search_text=", "fashion"],
-    "Kasta": ["https://kasta.ua/market/search/?q=", "fashion"],
-    
-    # КНИГИ И ДИДЖИТАЛ
+    "Moyo": ["https://www.moyo.ua/search/?q=", "tech"],
+    "Stylus": ["https://stylus.ua/uk/search?q=", "tech"],
     "Yakaboo": ["https://www.yakaboo.ua/search/?query=", "books"],
-    "Bukva": ["https://bukva.ua/search/?query=", "books"],
-    "Megogo": ["https://megogo.net/ru/search?q=", "digital"],
-    
-    # КОСМЕТИКА И ЗДОРОВЬЕ
     "Makeup": ["https://makeup.com.ua/search/?q=", "beauty"],
-    "Parfums": ["https://parfums.ua/search?q=", "beauty"],
     "Eva": ["https://eva.ua/ua/search/?q=", "beauty"],
-    "Apteka911": ["https://apteka911.ua/search?q=", "health"],
-    
-    # ПРОДУКТЫ
-    "Novus": ["https://novus.online/search?text=", "food"],
     "Silpo": ["https://silpo.ua/search?q=", "food"],
     "ATB": ["https://www.atbmarket.com/search?query=", "food"]
 }
 
-# --- [ СИСТЕМА УПРАВЛЕНИЯ ] ---
-USERS_FILE = "nexus_users.json"
-LAST_QUERY_INFO = {"cat": "none", "raw": ""}
+# --- [ СИСТЕМА ЛОГОВ ] ---
+LOG_HISTORY = []
+USERS_DB = "titan_users.json"
+STATS = {"searches": 0, "errors": 0}
 
-def get_db():
-    if not os.path.exists(USERS_FILE): return []
-    with open(USERS_FILE, "r") as f: return json.load(f)
+def add_log(msg):
+    t = datetime.now().strftime("%H:%M:%S")
+    LOG_HISTORY.append(f"[{t}] {msg}")
+    if len(LOG_HISTORY) > 15: LOG_HISTORY.pop(0)
 
-def save_user(u_id):
-    db = get_db()
-    if u_id not in db:
-        db.append(u_id); 
-        with open(USERS_FILE, "w") as f: json.dump(db, f)
+def manage_users(u_id=None):
+    if not os.path.exists(USERS_DB): 
+        with open(USERS_DB, "w") as f: json.dump([], f)
+    with open(USERS_DB, "r") as f: users = json.load(f)
+    if u_id and u_id not in users:
+        users.append(u_id)
+        with open(USERS_DB, "w") as f: json.dump(users, f)
+    return users
 
-# --- [ ИНТЕЛЛЕКТ ] ---
-async def ai_classifier(text):
+# --- [ ИИ ЛОГИКА ] ---
+async def titan_ai(text):
     if not ai_client: return text, "all"
     try:
         resp = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "system", "content": "Return JSON: {'q': 'keywords', 'cat': 'tech|auto|fashion|food|books|beauty|health|all'}"},
+            messages=[{"role": "system", "content": "Return JSON: {'q': 'clean text', 'cat': 'tech|auto|fashion|food|books|beauty|all'}"},
                       {"role": "user", "content": text}],
             response_format={"type": "json_object"}
         )
         res = json.loads(resp.choices[0].message.content)
-        LAST_QUERY_INFO["cat"] = res.get('cat', 'all')
         return res.get('q', text), res.get('cat', 'all')
     except: return text, "all"
 
-# --- [ УЛУЧШЕННЫЙ СКРЕЙПЕР ] ---
-async def deep_fetch(context, name, url, query):
+# --- [ ЯДРО TITAN SCRAPER ] ---
+async def scrape_engine(context, name, url, query):
     page = await context.new_page()
+    # Скрываем следы бота
+    await page.set_extra_http_headers({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8"
+    })
+    
     try:
-        search_url = f"{url}{query.replace(' ', '+')}"
-        # Эмуляция реального пользователя
-        await page.set_extra_http_headers({"Accept-Language": "uk-UA,uk;q=0.9"})
-        await page.goto(search_url, timeout=40000, wait_until="domcontentloaded")
-        await asyncio.sleep(3) # Ждем прогрузки карточек
+        full_url = f"{url}{query.replace(' ', '+')}"
+        await page.goto(full_url, timeout=45000, wait_until="domcontentloaded")
         
-        # УЛУЧШЕННЫЙ ПОИСК ССЫЛОК (добавлены auto-, obyavlenie, product-)
-        links = await page.query_selector_all('a[href*="auto"], a[href*="item"], a[href*="product"], a[href*="obyavlenie"], a[href*="p-"]')
-        if not links: # Если спец-ссылки не найдены, берем все крупные ссылки
-            links = await page.query_selector_all('a')
+        # Проверка на Cloudflare
+        if "challenge-platform" in await page.content() or "captcha" in await page.url():
+            add_log(f"Blocked by WAF: {name}")
+            return [f"🛡 **{name}**: Заблокировано защитой (WAF)."]
 
-        results = []
-        for l in links:
-            href = await l.get_attribute('href')
-            text = (await l.inner_text()).strip()
-            
-            # Фильтр мусора: текст должен быть длинным (название товара), а ссылка не пустой
-            if href and len(text) > 20 and not any(x in href for x in ['login', 'cart', 'compare']):
-                if not href.startswith('http'): 
-                    domain = url.split('/')[2]
-                    href = f"https://{domain}{href}"
-                
-                results.append(f"📦 **{name}**: {text[:60]}...\n🔗 {href}")
-                if len(results) >= 2: break
-        return results
+        await asyncio.sleep(random.uniform(2, 4)) # Эмуляция человека
+        
+        # Поиск ссылок через JavaScript (более надежно)
+        items = await page.evaluate("""
+            () => {
+                const links = Array.from(document.querySelectorAll('a'));
+                return links
+                    .filter(a => a.href.includes('product') || a.href.includes('item') || a.href.includes('auto') || a.href.includes('obyavlenie'))
+                    .map(a => ({ text: a.innerText.trim(), href: a.href }))
+                    .filter(a => a.text.length > 20)
+                    .slice(0, 2);
+            }
+        """)
+
+        if not items: return []
+        
+        res = []
+        for i in items:
+            res.append(f"📦 **{name}**: {i['text'][:55]}...\n🔗 {i['href']}")
+        return res
+
     except Exception as e:
-        return [f"⚠️ {name}: Ошибка связи."]
-    finally: await page.close()
+        STATS["errors"] += 1
+        return [f"⚠️ **{name}**: Тайм-аут или ошибка связи."]
+    finally:
+        await page.close()
 
-# --- [ NEXUS ADMIN PANEL ] ---
-def admin_kb():
+# --- [ ADMIN TITAN PANEL ] ---
+def get_admin_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="💎 База Юзеров"), KeyboardButton(text="📡 Состояние AI")],
-        [KeyboardButton(text="📢 Рассылка (All)"), KeyboardButton(text="🧹 Очистить логи")],
-        [KeyboardButton(text="⚙️ Тест Сайтов"), KeyboardButton(text="🚪 Exit")]
+        [KeyboardButton(text="📈 Stats"), KeyboardButton(text="📜 Live Logs")],
+        [KeyboardButton(text="🔑 Terminal"), KeyboardButton(text="📢 Broadcast")],
+        [KeyboardButton(text="♻️ Reset Browser"), KeyboardButton(text="❌ Exit")]
     ], resize_keyboard=True)
 
 @dp.message(Command("admin"))
-async def open_nexus_admin(message: types.Message):
+async def admin_panel(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
-    await message.answer("🛠 **CHIIP NEXUS: ROOT ACCESS**", reply_markup=admin_kb())
+    await message.answer("🦾 **CHIIP TITAN: CONTROL UNIT**", reply_markup=get_admin_kb())
 
-@dp.message(F.text == "💎 База Юзеров")
-async def db_stats(message: types.Message):
+@dp.message(F.text == "📜 Live Logs")
+async def show_logs(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        db = get_db()
-        await message.answer(f"👥 **Всего пользователей:** {len(db)}\nID: `{db[:10]}...`", parse_mode="Markdown")
+        logs = "\n".join(LOG_HISTORY[-10:]) if LOG_HISTORY else "Логи пусты."
+        await message.answer(f"📋 **ПОСЛЕДНИЕ СОБЫТИЯ:**\n\n`{logs}`", parse_mode="Markdown")
 
-@dp.message(F.text == "📡 Состояние AI")
-async def ai_status(message: types.Message):
+@dp.message(F.text == "📈 Stats")
+async def show_stats(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        await message.answer(f"🤖 **Последняя классификация:**\nКатегория: `{LAST_QUERY_INFO['cat']}`\nЗапрос: `{LAST_QUERY_INFO['raw']}`", parse_mode="Markdown")
+        users = manage_users()
+        await message.answer(f"📊 **ДАННЫЕ:**\n\nЮзеры: {len(users)}\nПоисков: {STATS['searches']}\nОшибок: {STATS['errors']}")
 
-@dp.message(F.text == "⚙️ Тест Сайтов")
-async def site_test(message: types.Message):
+@dp.message(F.text == "🔑 Terminal")
+async def term_info(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        test_list = random.sample(list(SITES.keys()), 3)
-        await message.answer(f"🧪 **Проверка связи:** {', '.join(test_list)}... (в очереди)")
+        await message.answer("Введи системную команду через префикс `>`\nПример: `>df -h` или `>free -m`")
 
-@dp.message(F.text.startswith("!send "))
-async def mass_broadcast(message: types.Message):
+@dp.message(F.text.startswith(">"))
+async def run_terminal(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        text = message.text.replace("!send ", "")
-        db = get_db()
-        for u in db:
-            try: await bot.send_message(u, f"📡 **ВЕЩАНИЕ CHIIP:**\n\n{text}")
+        cmd = message.text[1:]
+        try:
+            res = subprocess.check_output(cmd, shell=True).decode()
+            await message.answer(f"💻 **Output:**\n`{res[:3500]}`", parse_mode="Markdown")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(F.text == "📢 Broadcast")
+async def bc_start(message: types.Message):
+    if message.from_user.id == ADMIN_ID:
+        await message.answer("Напиши сообщение с префиксом `!ALL` для рассылки.")
+
+@dp.message(F.text.startswith("!ALL"))
+async def bc_run(message: types.Message):
+    if message.from_user.id == ADMIN_ID:
+        msg = message.text.replace("!ALL", "").strip()
+        users = manage_users()
+        count = 0
+        for u in users:
+            try:
+                await bot.send_message(u, f"📡 **ОПОВЕЩЕНИЕ:**\n\n{msg}")
+                count += 1
             except: continue
-        await message.answer("✅ Рассылка завершена.")
+        await message.answer(f"✅ Отправлено {count} пользователям.")
 
-# --- [ ГЛАВНЫЙ ФУНКЦИОНАЛ ] ---
+# --- [ ГЛАВНЫЙ ЦИКЛ ПОИСКА ] ---
 @dp.message(Command("start"))
-async def welcome(message: types.Message):
-    save_user(message.from_user.id)
-    await message.answer("🚀 **CHIIP v10.0 NEXUS АКТИВИРОВАН**\nВ базе 50+ магазинов. Введи товар:")
+async def cmd_start(message: types.Message):
+    manage_users(message.from_user.id)
+    await message.answer("🛡 **CHIIP TITAN v11.0** запущен.\nЯ использую обход блокировок и ИИ для поиска. Что ищем?")
 
 @dp.message()
-async def search_engine(message: types.Message):
-    if message.text == "🚪 Exit":
+async def titan_search(message: types.Message):
+    if message.text == "❌ Exit":
         await message.answer("Панель закрыта.", reply_markup=ReplyKeyboardRemove()); return
+    
+    if message.from_user.id == ADMIN_ID and message.text in ["📈 Stats", "📜 Live Logs", "🔑 Terminal", "📢 Broadcast", "♻️ Reset Browser"]: return
 
-    save_user(message.from_user.id)
-    LAST_QUERY_INFO["raw"] = message.text
+    manage_users(message.from_user.id)
+    STATS["searches"] += 1
     
-    status = await message.answer("🛸 *Квантовый анализ запроса...*")
+    status = await message.answer("📡 *ИИ анализирует запрос...*")
     
-    query, category = await ai_classifier(message.text)
+    q, cat = await titan_ai(message.text)
+    add_log(f"Query: {q} | Cat: {cat}")
     
-    # ФИЛЬТРАЦИЯ САЙТОВ: выбираем только нужные категории
-    target_sites = [n for n, d in SITES.items() if d[1] == category]
-    if not target_sites or category == "all": 
-        target_sites = ["OLX", "Prom", "Rozetka", "Auto.ria"] # Дефолтные гиганты
-    
-    # Ограничиваем выборку для скорости на Render
-    selected = target_sites[:5]
-    
-    await status.edit_text(f"🔍 *Ищу '{query}' на {', '.join(selected)}...*")
+    # Подбор сайтов: категория + универсальные
+    target = [n for n, d in SITES.items() if d[1] == cat or d[1] == "all"]
+    random.shuffle(target)
+    selected = target[:4] # Берем 4 сайта за раз для стабильности
+
+    await status.edit_text(f"🛰 *Сканирую {', '.join(selected)}...*")
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        # Улучшенные аргументы против детекции
+        browser = await p.chromium.launch(headless=True, args=[
+            '--no-sandbox', 
+            '--disable-setuid-sandbox',
+            '--disable-blink-features=AutomationControlled'
+        ])
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
         
-        tasks = [deep_fetch(context, name, SITES[name][0], query) for name in selected]
+        tasks = [scrape_engine(context, name, SITES[name][0], q) for name in selected]
         results = await asyncio.gather(*tasks)
         await browser.close()
 
-    final_results = [item for sub in results for item in sub]
+    flat_results = [item for sub in results for item in sub]
     
     await status.delete()
-    if final_results:
-        response = f"🏁 **РЕЗУЛЬТАТЫ ПОИСКА:**\n\n" + "\n\n".join(final_results)
-        await message.answer(response, parse_mode="Markdown", disable_web_page_preview=True)
+    if flat_results:
+        final_msg = f"🏁 **РЕЗУЛЬТАТЫ ПОИСКА (TITAN):**\n\n" + "\n\n".join(flat_results)
+        await message.answer(final_msg, parse_mode="Markdown", disable_web_page_preview=True)
     else:
-        await message.answer("❌ **CHIIP ничего не нашел.**\n\n*Причина:* Сайт заблокировал запрос или товар отсутствует. Попробуй изменить название.")
+        await message.answer("⚠️ **Ничего не найдено.**\n\nСайты могли временно заблокировать доступ. Попробуй другой запрос или повтори позже.")
 
-# --- [ СЕРВЕР И СТАРТ ] ---
-async def start_web():
+# --- [ СЕРВЕР ] ---
+async def handle_ping(request): return web.Response(text="TITAN_CORE_ACTIVE")
+
+async def main():
+    add_log("System Rebooted")
+    # Установка Playwright
+    subprocess.run(["playwright", "install", "chromium"])
+    
     app = web.Application()
-    app.router.add_get("/", lambda r: web.Response(text="NEXUS_ONLINE"))
+    app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
-
-async def main():
-    # Принудительная установка для Render
-    subprocess.run(["playwright", "install", "chromium"])
-    await asyncio.gather(start_web(), dp.start_polling(bot))
+    
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
