@@ -1,242 +1,213 @@
-import asyncio, os, json, subprocess, logging, random, time, sys
+import asyncio, os, json, subprocess, random, time, sys
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, FSInputFile
 from playwright.async_api import async_playwright
 from aiohttp import web
-import openai
 
-# --- [ CONFIG ] ---
+# --- [ КРИТИЧЕСКИЕ НАСТРОЙКИ ] ---
 TG_TOKEN = os.getenv('TG_TOKEN')
-OPENAI_KEY = os.getenv('OPENAI_KEY')
 ADMIN_ID = 5476069446
 PORT = int(os.environ.get("PORT", 8080))
 
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
-ai_client = openai.AsyncOpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
-# --- [ SYSTEM STATE ] ---
-START_TIME = time.time()
-USERS_DB = "nebula_users.json"
-LOG_FILE = "nebula.log"
-CONFIG_FILE = "config.json"
-STATS = {"searches": 0, "errors": 0, "success": 0}
+# --- [ СИСТЕМНЫЕ ФАЙЛЫ ] ---
+USERS_DB = "quantum_users.json"
+LOG_FILE = "quantum.log"
+STATS = {"searches": 0, "errors": 0}
 
-# Дефолтный конфиг
-DEFAULT_CONFIG = {"timeout": 45000, "turbo": False, "maint": False, "proxy": None}
-if not os.path.exists(CONFIG_FILE):
-    with open(CONFIG_FILE, "w") as f: json.dump(DEFAULT_CONFIG, f)
+# Инициализация базы данных
+def db_core(action="get", u_id=None, data=None):
+    if not os.path.exists(USERS_DB): 
+        with open(USERS_DB, "w") as f: json.dump({}, f)
+    
+    with open(USERS_DB, "r") as f:
+        db = json.load(f)
+    
+    u_id = str(u_id)
+    if action == "reg" and u_id not in db:
+        db[u_id] = {"joined": datetime.now().strftime("%d.%m.%Y"), "searches": 0, "history": [], "banned": False}
+    elif action == "inc" and u_id in db:
+        db[u_id]["searches"] += 1
+        db[u_id]["history"] = ([data] + db[u_id]["history"])[:5]
+    elif action == "ban" and u_id in db:
+        db[u_id]["banned"] = not db[u_id]["banned"]
+    
+    with open(USERS_DB, "w") as f: json.dump(db, f, indent=4)
+    return db
 
-def get_conf(): return json.load(open(CONFIG_FILE))
-def set_conf(c): json.dump(c, open(CONFIG_FILE, "w"))
+# --- [ МЕНЮ ПОЛЬЗОВАТЕЛЯ ] ---
+def kb_user_main():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🔍 Найти товар")],
+        [KeyboardButton(text="👤 Мой Профиль"), KeyboardButton(text="📜 История")],
+        [KeyboardButton(text="🆘 Поддержка"), KeyboardButton(text="⚙️ Настройки")]
+    ], resize_keyboard=True)
 
-# --- [ DB & LOGS ] ---
-def add_log(msg):
-    with open(LOG_FILE, "a") as f:
-        f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
-
-def manage_users(action="get", u_id=None):
-    if not os.path.exists(USERS_DB): json.dump([], open(USERS_DB, "w"))
-    users = json.load(open(USERS_DB))
-    if action == "add" and u_id not in users:
-        users.append(u_id); json.dump(users, open(USERS_DB, "w"))
-    return users
-
-# --- [ КЛАВИАТУРЫ (МНОГОУРОВНЕВЫЕ) ] ---
+# --- [ МЕНЮ АДМИНА ] ---
 def kb_admin_main():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🖥 СИСТЕМА"), KeyboardButton(text="👥 ЮЗЕРЫ")],
-        [KeyboardButton(text="⚙️ НАСТРОЙКИ"), KeyboardButton(text="📢 РАССЫЛКА")],
-        [KeyboardButton(text="🔑 ТЕРМИНАЛ"), KeyboardButton(text="🚪 ВЫХОД")]
+        [KeyboardButton(text="🛡 СЕРВЕР"), KeyboardButton(text="🔋 ПОЛЬЗОВАТЕЛИ")],
+        [KeyboardButton(text="📣 РАССЫЛКА"), KeyboardButton(text="☢️ ТЕРМИНАЛ")],
+        [KeyboardButton(text="🔙 В МЕНЮ ЮЗЕРА")]
     ], resize_keyboard=True)
 
-def kb_admin_sys():
+def kb_admin_users_manage():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📊 Полная Статистика"), KeyboardButton(text="📜 Логи")],
-        [KeyboardButton(text="🧹 Очистить Кэш/RAM"), KeyboardButton(text="⚡️ Ребут")],
-        [KeyboardButton(text="🔙 Назад")]
+        [KeyboardButton(text="📁 Дамп Базы"), KeyboardButton(text="🚫 Бан/Разбан по ID")],
+        [KeyboardButton(text="🔙 Назад в Админку")]
     ], resize_keyboard=True)
 
-def kb_admin_users():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📂 Выгрузить БД"), KeyboardButton(text="🔍 Найти Юзера")],
-        [KeyboardButton(text="🚫 Бан-лист"), KeyboardButton(text="🔙 Назад")]
-    ], resize_keyboard=True)
+# --- [ ОБРАБОТЧИКИ КОМАНД ] ---
 
-def kb_admin_conf():
-    c = get_conf()
-    t_status = "ВКЛ" if c['turbo'] else "ВЫКЛ"
-    m_status = "ВКЛ" if c['maint'] else "ВЫКЛ"
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text=f"🚀 Турбо: {t_status}"), KeyboardButton(text=f"🛠 Техраб: {m_status}")],
-        [KeyboardButton(text="⏱ Сменить Тайм-аут"), KeyboardButton(text="🎭 Сменить User-Agent")],
-        [KeyboardButton(text="🔙 Назад")]
-    ], resize_keyboard=True)
-
-# --- [ AI ROUTING ENGINE ] ---
-async def nebula_ai_router(text):
-    if not ai_client: return text, ["Rozetka", "Prom", "OLX"]
-    try:
-        prompt = f"""Analyze query: '{text}'. 
-        Return JSON ONLY: {{"q": "clean product name", "type": "part|car|item"}}"""
-        resp = await ai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
-        )
-        res = json.loads(resp.choices[0].message.content)
-        q = res.get("q", text)
-        t = res.get("type", "item")
-        
-        if t == "car": return q, ["Auto.ria", "OLX", "RST"]
-        if t == "part": return q, ["Prom", "OLX", "Epicentr"]
-        return q, ["Rozetka", "Prom", "OLX"]
-    except: return text, ["Rozetka", "Prom", "OLX"]
-
-# --- [ SCRAPE ENGINE ] ---
-async def scrape_nebula(context, name, query):
-    urls = {
-        "Rozetka": "https://rozetka.com.ua/search/?text=",
-        "Prom": "https://prom.ua/search?search_term=",
-        "OLX": "https://www.olx.ua/d/uk/list/q-",
-        "Auto.ria": "https://auto.ria.com/uk/search/?q=",
-        "RST": "https://rst.ua/uk/oldcars/?task=search&q=",
-        "Epicentr": "https://epicentrk.ua/search/?q="
-    }
-    page = await context.new_page()
-    conf = get_conf()
-    try:
-        full_url = f"{urls[name]}{query.replace(' ', '+')}"
-        await page.goto(full_url, wait_until="domcontentloaded", timeout=conf['timeout'])
-        await asyncio.sleep(3)
-
-        results = await page.evaluate(f"""
-            () => {{
-                const qWords = "{query.lower()}".split(" ");
-                return Array.from(document.querySelectorAll('a'))
-                    .filter(a => {{
-                        const text = a.innerText.toLowerCase();
-                        const href = a.href;
-                        return qWords.every(w => text.includes(w)) && 
-                               !href.includes('google') && text.length > 15;
-                    }})
-                    .slice(0, 2)
-                    .map(a => ({{ t: a.innerText.trim(), h: a.href }}));
-            }}
-        """)
-        return [f"📦 **{name}**: {r['t'][:55]}...\n🔗 {r['h']}" for r in results]
-    except: return []
-    finally: await page.close()
-
-# --- [ COMMAND HANDLERS ] ---
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    db_core("reg", message.from_user.id)
+    welcome_text = (
+        f"🛡 **CHIIP QUANTUM v15.0 АКТИВИРОВАН**\n\n"
+        f"Привет, {message.from_user.first_name}!\n"
+        f"Я использую ИИ и Playwright для поиска товаров по всем топ-площадкам."
+    )
+    await message.answer(welcome_text, reply_markup=kb_user_main(), parse_mode="Markdown")
 
 @dp.message(Command("admin"))
-async def admin_entry(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    await message.answer("🦾 **NEBULA CORE: ДОСТУП РАЗРЕШЕН**", reply_markup=kb_admin_main())
-
-@dp.message(F.text == "🖥 СИСТЕМА")
-async def admin_sys(message: types.Message):
-    if message.from_user.id == ADMIN_ID: await message.answer("Меню системы:", reply_markup=kb_admin_sys())
-
-@dp.message(F.text == "👥 ЮЗЕРЫ")
-async def admin_usr(message: types.Message):
-    if message.from_user.id == ADMIN_ID: await message.answer("Управление пользователями:", reply_markup=kb_admin_users())
-
-@dp.message(F.text == "⚙️ НАСТРОЙКИ")
-async def admin_set(message: types.Message):
-    if message.from_user.id == ADMIN_ID: await message.answer("Конфигурация бота:", reply_markup=kb_admin_conf())
-
-@dp.message(F.text == "🔙 Назад")
-async def admin_back(message: types.Message):
-    if message.from_user.id == ADMIN_ID: await message.answer("Главное меню:", reply_markup=kb_admin_main())
-
-@dp.message(F.text == "🧹 Очистить Кэш/RAM")
-async def clear_system(message: types.Message):
+async def cmd_admin(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        subprocess.run("pkill chromium", shell=True)
-        await message.answer("🧹 Все процессы браузера убиты. ОЗУ очищена.")
+        await message.answer("🧬 **QUANTUM CORE: ПАНЕЛЬ УПРАВЛЕНИЯ**", reply_markup=kb_admin_main())
 
-@dp.message(F.text.startswith("🚀 Турбо:"))
-async def toggle_turbo(message: types.Message):
-    if message.from_user.id == ADMIN_ID:
-        c = get_conf(); c['turbo'] = not c['turbo']
-        c['timeout'] = 80000 if c['turbo'] else 45000
-        set_conf(c)
-        await message.answer(f"Турбо-режим: {'ВКЛ' if c['turbo'] else 'ВЫКЛ'}", reply_markup=kb_admin_conf())
+# --- [ ФУНКЦИИ ЮЗЕРА ] ---
 
-@dp.message(F.text == "📊 Полная Статистика")
-async def full_stats(message: types.Message):
+@dp.message(F.text == "👤 Мой Профиль")
+async def user_profile(message: types.Message):
+    db = db_core()
+    user = db.get(str(message.from_user.id))
+    text = (f"👤 **ВАШ ПРОФИЛЬ**\n\n"
+            f"🆔 ID: `{message.from_user.id}`\n"
+            f"📅 Регистрация: {user['joined']}\n"
+            f"🔎 Поисков: {user['searches']}")
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "📜 История")
+async def user_history(message: types.Message):
+    db = db_core()
+    hist = db.get(str(message.from_user.id), {}).get("history", [])
+    text = "📜 **ПОСЛЕДНИЕ ЗАПРОСЫ:**\n\n" + ("\n".join([f"- {i}" for i in hist]) if hist else "Пусто")
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "🔍 Найти товар")
+async def find_prompt(message: types.Message):
+    await message.answer("Просто введи название товара, и я начну поиск!")
+
+# --- [ ФУНКЦИИ АДМИНА ] ---
+
+@dp.message(F.text == "🔋 ПОЛЬЗОВАТЕЛИ")
+async def admin_users(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        uptime = str(datetime.utcfromtimestamp(time.time() - START_TIME).strftime('%H:%M:%S'))
+        await message.answer("Управление пользователями:", reply_markup=kb_admin_users_manage())
+
+@dp.message(F.text == "📁 Дамп Базы")
+async def admin_dump(message: types.Message):
+    if message.from_user.id == ADMIN_ID:
+        db_core() # Убедиться, что файл создан
+        await message.answer_document(FSInputFile(USERS_DB), caption="📦 Актуальная база QUANTUM")
+
+@dp.message(F.text == "🛡 СЕРВЕР")
+async def admin_server(message: types.Message):
+    if message.from_user.id == ADMIN_ID:
         mem = subprocess.getoutput("free -m | grep Mem | awk '{print $3}'")
-        await message.answer(f"📈 **NEBULA REPORT**\n\nUptime: {uptime}\nRAM Used: {mem}MB\nUsers: {len(manage_users())}\nSearches: {STATS['searches']}\nSuccess: {STATS['success']}")
+        uptime = subprocess.getoutput("uptime -p")
+        db = db_core()
+        text = (f"🛡 **SERVER STATUS**\n\n"
+                f"🧠 RAM Used: {mem}MB\n"
+                f"⏱ Uptime: {uptime}\n"
+                f"👥 Всего юзеров: {len(db)}\n"
+                f"📊 Общих поисков: {STATS['searches']}")
+        await message.answer(text, parse_mode="Markdown")
 
-@dp.message(F.text == "🔑 ТЕРМИНАЛ")
-async def term_info(message: types.Message):
-    if message.from_user.id == ADMIN_ID:
-        await message.answer("Введи команду через `>` (например `>df -h`)")
+@dp.message(F.text == "🔙 В МЕНЮ ЮЗЕРА")
+async def back_to_user(message: types.Message):
+    await message.answer("Вы вернулись в обычный режим.", reply_markup=kb_user_main())
 
-@dp.message(F.text.startswith(">"))
-async def term_exec(message: types.Message):
-    if message.from_user.id == ADMIN_ID:
-        cmd = message.text[1:].strip().rstrip(".")
-        try:
-            res = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode()
-            await message.answer(f"💻 `Output:`\n`{res[:3500]}`", parse_mode="Markdown")
-        except Exception as e:
-            await message.answer(f"❌ Ошибка:\n`{str(e)}`")
+@dp.message(F.text == "🔙 Назад в Админку")
+async def back_to_admin(message: types.Message):
+    await message.answer("Главное меню админа:", reply_markup=kb_admin_main())
 
-# --- [ ОСНОВНОЙ ПОИСК ] ---
+# --- [ ГЛОБАЛЬНЫЙ ПОИСК (ИСПРАВЛЕННЫЙ) ] ---
 
 @dp.message()
-async def main_search(message: types.Message):
-    if message.from_user.id == ADMIN_ID and message.text in ["🖥 СИСТЕМА", "👥 ЮЗЕРЫ", "⚙️ НАСТРОЙКИ", "📢 РАССЫЛКА", "🔑 ТЕРМИНАЛ", "🚪 ВЫХОД", "🔙 Назад"]: return
-    
-    manage_users("add", message.from_user.id)
-    conf = get_conf()
-    if conf['maint'] and message.from_user.id != ADMIN_ID:
-        await message.answer("🛠 Извини, я на техобслуживании."); return
+async def global_handler(message: types.Message):
+    # 1. Проверка на бан
+    db = db_core()
+    user_data = db.get(str(message.from_user.id))
+    if user_data and user_data.get("banned"):
+        return await message.answer("🚫 Вы заблокированы в системе.")
 
+    # 2. ИГНОРИРУЕМ КНОПКИ И КОМАНДЫ (Чтобы не искать их в Google)
+    reserved_buttons = [
+        "👤 Мой Профиль", "📜 История", "🆘 Поддержка", "⚙️ Настройки", "🔍 Найти товар",
+        "🛡 СЕРВЕР", "🔋 ПОЛЬЗОВАТЕЛИ", "📣 РАССЫЛКА", "☢️ ТЕРМИНАЛ", "🔙 В МЕНЮ ЮЗЕРА",
+        "📁 Дамп Базы", "🚫 Бан/Разбан по ID", "🔙 Назад в Админку", "📊 Полная Статистика", "📜 Логи", "🔙 Назад"
+    ]
+    if message.text in reserved_buttons or message.text.startswith("/"):
+        # Если это текст кнопки, но он попал сюда — значит мы просто ничего не делаем или логируем
+        return
+
+    # 3. ЛОГИКА ПОИСКА
     STATS["searches"] += 1
-    status = await message.answer("🛰 *NEBULA анализирует запрос...*")
+    db_core("inc", message.from_user.id, message.text)
     
-    # ИИ роутинг (запчасти или машина?)
-    clean_q, sites = await nebula_ai_router(message.text)
+    status = await message.answer(f"🛰 *QUANTUM сканирует сети по запросу: {message.text}...*", parse_mode="Markdown")
     
-    await status.edit_text(f"📡 *Поиск {clean_q} по базе {', '.join(sites)}...*")
+    # Определение сайтов
+    query = message.text.lower()
+    sites = {"Prom": f"https://prom.ua/search?search_term={query}", "OLX": f"https://www.olx.ua/d/uk/list/q-{query}"}
     
+    if any(x in query for x in ["bmw", "mazda", "audi", "авто", "машина"]):
+        sites["AutoRia"] = f"https://auto.ria.com/uk/search/?q={query}"
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
-        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        
-        tasks = [scrape_nebula(context, name, clean_q) for name in sites]
-        results = await asyncio.gather(*tasks)
-        await browser.close()
+        try:
+            browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+            context = await browser.new_context(user_agent="Mozilla/5.0")
+            
+            final_results = []
+            for name, url in sites.items():
+                page = await context.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=40000)
+                # Базовый парсинг ссылок
+                links = await page.evaluate("""
+                    () => Array.from(document.querySelectorAll('a'))
+                        .filter(a => a.innerText.length > 20 && a.href.includes('http'))
+                        .slice(0, 1)
+                        .map(a => ({t: a.innerText.trim(), h: a.href}))
+                """)
+                for l in links:
+                    final_results.append(f"📦 **{name}**: {l['t'][:50]}...\n🔗 {l['h']}")
+                await page.close()
+            
+            await browser.close()
+            await status.delete()
+            
+            if final_results:
+                await message.answer("✅ **РЕЗУЛЬТАТЫ QUANTUM:**\n\n" + "\n\n".join(final_results), disable_web_page_preview=True)
+            else:
+                await message.answer("❌ Ничего не найдено. Попробуй уточнить запрос.")
+                
+        except Exception as e:
+            await status.edit_text(f"⚠️ Ошибка поиска: {str(e)[:50]}")
 
-    flat = [item for sub in results for item in sub]
-    await status.delete()
-    
-    if flat:
-        STATS["success"] += 1
-        await message.answer(f"✅ **РЕЗУЛЬТАТЫ NEBULA:**\n\n" + "\n\n".join(flat), disable_web_page_preview=True)
-    else:
-        STATS["errors"] += 1
-        await message.answer("❌ **Точных совпадений не найдено.**\nПопробуй изменить запрос.")
-
-# --- [ SERVER ] ---
-async def start_server():
+# --- [ ЗАПУСК ] ---
+async def main():
+    subprocess.run(["playwright", "install", "chromium"])
     app = web.Application()
-    app.router.add_get("/", lambda r: web.Response(text="NEBULA_ONLINE"))
+    app.router.add_get("/", lambda r: web.Response(text="QUANTUM_RUNNING"))
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
-
-async def main():
-    subprocess.run(["playwright", "install", "chromium"])
-    await asyncio.gather(start_server(), dp.start_polling(bot))
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
