@@ -1,4 +1,3 @@
 aiogram
+playwright
 aiohttp
-beautifulsoup4
-openai
