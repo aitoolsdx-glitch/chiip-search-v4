@@ -8,10 +8,7 @@ from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
-from aiogram.types import (
-    ReplyKeyboardMarkup, KeyboardButton, 
-    FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
-)
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile, BotCommand
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -20,7 +17,7 @@ from bs4 import BeautifulSoup
 import aiohttp
 from aiohttp import web
 
-# --- [ КОНФИГУРАЦИЯ ] ---
+# --- CONFIG ---
 TG_TOKEN = os.getenv('TG_TOKEN')
 OPENAI_KEY = os.getenv('OPENAI_KEY')
 ADMIN_ID = 5476069446
@@ -29,180 +26,135 @@ PORT = int(os.environ.get("PORT", 8080))
 ai_client = AsyncOpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-logger = logging.getLogger("TITAN-FORCE")
+logger = logging.getLogger("TITAN-CORE")
 
-# --- [ СОСТОЯНИЯ ] ---
-class AdminStates(StatesGroup):
-    broadcast = State()
-    terminal = State()
+class SystemStates(StatesGroup):
+    adm_term = State()
+    adm_mail = State()
 
-# --- [ БАЗА ДАННЫХ ] ---
-DB_PATH = "titan_database.json"
+# --- DATABASE ---
+DB_PATH = "titan_core.json"
 
-def load_db():
-    if not os.path.exists(DB_PATH): return {"users": {}, "stats": {"searches": 0}}
+def get_data():
+    if not os.path.exists(DB_PATH): return {"users": {}, "stats": {"q": 0}}
     with open(DB_PATH, "r", encoding='utf-8') as f: return json.load(f)
 
-def save_db(data):
-    with open(DB_PATH, "w", encoding='utf-8') as f: 
-        json.dump(data, f, indent=4, ensure_all_ascii=False)
+def save_data(data):
+    with open(DB_PATH, "w", encoding='utf-8') as f: json.dump(data, f, indent=4, ensure_all_ascii=False)
 
-# --- [ КЛАВИАТУРЫ ] ---
+# --- KEYBOARDS ---
 def main_kb(uid):
-    btns = [
-        [KeyboardButton(text="🔎 Поиск по характеристикам")],
-        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🆘 Инфо")]
-    ]
-    if uid == ADMIN_ID:
-        btns.insert(0, [KeyboardButton(text="🔱 АДМИН-ЦЕНТР")])
+    btns = [[KeyboardButton(text="🔎 Искать по характеристикам")], [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📊 Статистика")]]
+    if uid == ADMIN_ID: btns.insert(0, [KeyboardButton(text="🔱 ТЕРМИНАЛ УПРАВЛЕНИЯ")])
     return ReplyKeyboardMarkup(keyboard=btns, resize_keyboard=True)
 
-def admin_kb():
+def adm_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="🐚 Консоль")],
-        [KeyboardButton(text="📊 Метрики"), KeyboardButton(text="📂 Дамп БД")],
-        [KeyboardButton(text="🔙 В главное меню")]
+        [KeyboardButton(text="🐚 Выполнить команду"), KeyboardButton(text="📢 Рассылка")],
+        [KeyboardButton(text="📂 Выгрузить БД"), KeyboardButton(text="🔙 Выход")]
     ], resize_keyboard=True)
 
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- [ ИИ-АНАЛИЗАТОР ] ---
-async def ai_analyze_results(query, raw_data):
-    if not ai_client or not raw_data:
-        return "⚠️ ИИ отключен или данных нет. Вот что нашел:\n" + "\n".join(raw_data[:3])
-    
-    prompt = f"""
-    Ты - эксперт по покупкам TITAN OMNI. 
-    Пользователь ищет: {query}
-    Вот найденные сырые данные: {raw_data}
-    Выбери 3 лучших варианта, которые реально подходят под характеристики. 
-    Напиши краткий вывод, почему это стоит купить.
-    """
+# --- ИИ ФУНКЦИЯ ---
+async def titan_ai_filter(query, raw_results):
+    if not ai_client or not raw_results: return raw_results[:3]
+    prompt = f"Пользователь ищет: {query}. Проанализируй список:\n{raw_results}\nВыбери 3 лучших варианта по характеристикам и цене. Напиши кратко почему."
     try:
-        res = await ai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}]
-        )
+        res = await ai_client.chat.completions.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}])
         return res.choices[0].message.content
-    except Exception as e:
-        return f"Ошибка ИИ: {e}\n\n" + "\n".join(raw_data[:3])
+    except: return "Ошибка ИИ. Вот что нашел:\n" + "\n".join(raw_results[:3])
 
-# --- [ СТАБИЛЬНЫЙ ПАРСИНГ (БЕЗ PLAYWRIGHT) ] ---
-async def fetch_titan(session, name, url_template, query):
+# --- ПАРСЕР ---
+async def fetch_ads(session, url, query):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
-        url = url_template.format(q=query.replace(" ", "+"))
-        async with session.get(url, headers=headers, timeout=15) as response:
-            if response.status != 200: return []
-            html = await response.text()
-            soup = BeautifulSoup(html, 'lxml')
-            
-            results = []
-            links = soup.find_all('a', href=True)
-            for l in links:
-                txt = l.text.strip().lower()
-                # Умный фильтр совпадений
-                if all(word in txt for word in query.lower().split()[:2]):
-                    href = l['href']
-                    if not href.startswith('http'): 
-                        domain = url.split('/')[2]
-                        href = f"https://{domain}{href}"
-                    if "olx.ua/d/uk/obyavlenie" in href or "/p" in href: # Фильтр только на товары
-                        results.append(f"{l.text.strip()[:60]} -> {href}")
-                if len(results) >= 5: break
-            return results
+        async with session.get(url.format(q=query.replace(" ", "+")), headers=headers, timeout=10) as r:
+            if r.status != 200: return []
+            soup = BeautifulSoup(await r.text(), 'lxml')
+            found = []
+            for a in soup.find_all('a', href=True):
+                txt = a.text.strip().lower()
+                if len(txt) > 20 and all(w in txt for w in query.lower().split()[:2]):
+                    link = a['href']
+                    if not link.startswith('http'): link = "https://" + url.split('/')[2] + link
+                    found.append(f"📦 {a.text.strip()[:60]}... \n🔗 {link}")
+                if len(found) >= 4: break
+            return found
     except: return []
 
-# --- [ ОБРАБОТЧИКИ ] ---
-
+# --- HANDLERS ---
 @dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    db = load_db()
-    uid = str(message.from_user.id)
+async def start(m: types.Message):
+    db = get_data()
+    uid = str(m.from_user.id)
     if uid not in db["users"]:
-        db["users"][uid] = {"name": message.from_user.full_name, "joined": str(datetime.now())}
-        save_db(db)
-    await message.answer("🦾 **TITAN OMNI v23.0 FORCE ONLINE**\n\nЯ готов искать любые товары по всем площадкам Украины через ИИ.", 
-                         reply_markup=main_kb(message.from_user.id))
+        db["users"][uid] = {"name": m.from_user.full_name, "reg": str(datetime.now())}
+        save_data(db)
+    await m.answer("🦾 **TITAN OMNI v24.0 BLACK OPS**\n\nСистема готова к поиску товаров через ИИ.", reply_markup=main_kb(m.from_user.id))
 
-@dp.message(F.text == "🔱 АДМИН-ЦЕНТР")
-async def adm_menu(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    await message.answer("🛠 Доступ к ядру разрешен.", reply_markup=admin_kb())
+@dp.message(F.text == "🔱 ТЕРМИНАЛ УПРАВЛЕНИЯ")
+async def adm_panel(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    await m.answer("⚙️ Доступ к ядру TITAN открыт.", reply_markup=adm_kb())
 
-@dp.message(F.text == "📊 Метрики")
-async def adm_metrics(message: types.Message):
-    db = load_db()
-    text = f"📊 **СТАТИСТИКА**\n\n👤 Пользователей: {len(db['users'])}\n🔎 Всего поисков: {db['stats']['searches']}"
-    await message.answer(text)
+@dp.message(F.text == "🐚 Выполнить команду")
+async def adm_shell(m: types.Message, state: FSMContext):
+    await state.set_state(SystemStates.adm_term)
+    await m.answer("🐚 Введите Bash-команду:")
 
-@dp.message(F.text == "🐚 Консоль")
-async def adm_term(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
-    await state.set_state(AdminStates.terminal)
-    await message.answer("🐚 Введите системную команду (bash):")
-
-@dp.message(AdminStates.terminal)
-async def term_exec(message: types.Message, state: FSMContext):
-    if message.text.lower() == "exit":
+@dp.message(SystemStates.adm_term)
+async def shell_exec(m: types.Message, state: FSMContext):
+    if m.text.lower() == "exit":
         await state.clear()
-        return await message.answer("Выход из консоли.", reply_markup=admin_kb())
-    try:
-        output = subprocess.getoutput(message.text)
-        await message.answer(f"📦 **Output:**\n`{output[:4000]}`", parse_mode="Markdown")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        return await m.answer("Выход...", reply_markup=adm_kb())
+    res = subprocess.getoutput(m.text)
+    await m.answer(f"Результат:\n`{res[:4000]}`", parse_mode="Markdown")
 
-@dp.message(F.text == "🔎 Поиск по характеристикам")
-async def search_init(message: types.Message):
-    await message.answer("📝 Введите запрос (например: *белые кроссовки Nike 42 размер до 3000 грн*):", parse_mode="Markdown")
+@dp.message(F.text == "🔎 Искать по характеристикам")
+async def search_init(m: types.Message):
+    await m.answer("📝 Напишите характеристики товара (напр. *ноутбук RTX 3060 до 40000грн*):", parse_mode="Markdown")
 
 @dp.message(F.text)
-async def process_search(message: types.Message):
-    if message.text in ["🔱 АДМИН-ЦЕНТР", "📊 Метрики", "🐚 Консоль", "🔎 Поиск по характеристикам", "🔙 В главное меню"]: return
+async def process_all(m: types.Message):
+    if m.text in ["🔱 ТЕРМИНАЛ УПРАВЛЕНИЯ", "🐚 Выполнить команду", "🔎 Искать по характеристикам", "🔙 Выход"]: return
     
-    db = load_db()
-    db["stats"]["searches"] += 1
-    save_db(db)
-
-    status = await message.answer("📡 **TITAN SCANNING...**\nПодключаюсь к OLX, Prom, Rozetka...")
-
+    db = get_data()
+    db["stats"]["q"] += 1
+    save_data(db)
+    
+    status = await m.answer("📡 **TITAN SCAN ACTIVE**\nПодключаюсь к OLX, Prom, Rozetka...")
+    
     sites = {
         "OLX": "https://www.olx.ua/d/uk/list/q-{q}/",
         "Prom": "https://prom.ua/search?search_term={q}",
         "Rozetka": "https://rozetka.com.ua/search/?text={q}"
     }
-
+    
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_titan(session, n, u, message.text) for n, u in sites.items()]
-        raw_results = await asyncio.gather(*tasks)
-
-    flat_list = [item for sub in raw_results for item in sub]
+        tasks = [fetch_ads(session, u, m.text) for u in sites.values()]
+        results = await asyncio.gather(*tasks)
     
-    if not flat_list:
-        await status.edit_text("❌ Ничего не найдено. Попробуйте изменить запрос.")
-        return
-
-    await status.edit_text("🤖 **ИИ TITAN АНАЛИЗИРУЕТ ВАРИАНТЫ...**")
+    all_raw = [i for sub in results for i in sub]
+    if not all_raw:
+        return await status.edit_text("❌ Ничего не найдено. Упростите запрос.")
     
-    ai_final = await ai_analyze_results(message.text, flat_list)
+    await status.edit_text("🤖 **ИИ АНАЛИЗИРУЕТ ВАРИАНТЫ...**")
+    final = await titan_ai_filter(m.text, all_raw)
     await status.delete()
-    await message.answer(f"✅ **РЕЗУЛЬТАТЫ TITAN-FORCE:**\n\n{ai_final}", disable_web_page_preview=True)
+    await m.answer(f"✅ **ЛУЧШИЕ ПРЕДЛОЖЕНИЯ:**\n\n{final}", disable_web_page_preview=True)
 
-# --- [ СЕРВЕР ] ---
-async def web_handle(request): return web.Response(text="TITAN ACTIVE")
+# --- SERVER ---
+async def web_h(r): return web.Response(text="TITAN CORE ONLINE")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Запуск веб-сервера для Render
     app = web.Application()
-    app.router.add_get("/", web_handle)
+    app.router.add_get("/", web_h)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
-    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
